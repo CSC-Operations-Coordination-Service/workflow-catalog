@@ -1,0 +1,222 @@
+# 1. Verify the Dockerfile with Checkov
+# 2. Build the dockerimage 
+# 3. Scan the dockerimage using Syft
+# 4. Store the SBOM as artifacts
+# 5. Scan the SBOM using Grype
+# 6. If the scan is “good” push it into the github repo (but ultimately, the dockerhub)
+name: Docker Security Pipeline
+
+on:
+  push:
+    branches: ["main", "docker-security-pipeline"]
+  pull_request:
+    branches: ["main", "docker-security-pipeline"]
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ── 1. Lint & verify the Dockerfile with Checkov ─────────────────────────
+  checkov-scan:
+    name: Checkov — Dockerfile Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov on Dockerfile
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .          # scans the whole repo recursively
+          framework: dockerfile
+          # Fail the job if any HIGH/CRITICAL check fails.
+          # Remove or adjust to soft-fail during initial onboarding:
+          soft_fail: false
+          output_format: cli,sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload Checkov SARIF report
+        if: always()                        # upload even on failure for review
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov-dockerfile
+
+  # ── 2. Build the Docker image ─────────────────────────────────────────────
+  # build:
+  #   name: Build Docker Image
+  #   runs-on: ubuntu-latest
+  #   needs: checkov-scan
+  #   outputs:
+  #     # Pass the exact image ref downstream so every job uses the same digest
+  #     image-ref: ${{ steps.meta.outputs.tags }}
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Docker Buildx
+  #       uses: docker/setup-buildx-action@v3
+
+  #     - name: Extract Docker metadata
+  #       id: meta
+  #       uses: docker/metadata-action@v5
+  #       with:
+  #         images: ${{ env.IMAGE_NAME }}
+  #         tags: |
+  #           type=sha,prefix=sha-,format=short
+  #           type=ref,event=branch
+  #           type=ref,event=pr
+
+  #     - name: Build image (load into local daemon, no push yet)
+  #       uses: docker/build-push-action@v6
+  #       with:
+  #         context: .
+  #         load: true              # make image available to subsequent steps
+  #         push: false
+  #         tags: ${{ steps.meta.outputs.tags }}
+  #         labels: ${{ steps.meta.outputs.labels }}
+  #         cache-from: type=gha
+  #         cache-to: type=gha,mode=max
+
+  #     # Export the image as a tarball so later jobs can reload it without
+  #     # having to rebuild from scratch.
+  #     - name: Save image to tar
+  #       run: |
+  #         IMAGE_REF=$(echo "${{ steps.meta.outputs.tags }}" | head -n1)
+  #         docker save "$IMAGE_REF" -o image.tar
+
+  #     - name: Upload image tarball
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: docker-image
+  #         path: image.tar
+  #         retention-days: 1
+
+  # # ── 3 & 4. Generate SBOM with Syft and store as artifact ─────────────────
+  # sbom:
+  #   name: SBOM — Syft
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   steps:
+  #     - name: Download image tarball
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: docker-image
+
+  #     - name: Load image into Docker daemon
+  #       run: docker load -i image.tar
+
+  #     - name: Install Syft
+  #       uses: anchore/sbom-action/download-syft@v0
+
+  #     - name: Generate SBOM (SPDX + CycloneDX)
+  #       run: |
+  #         IMAGE_REF=$(docker images --format "{{.Repository}}:{{.Tag}}" | head -n1)
+  #         syft "$IMAGE_REF" -o spdx-json=sbom.spdx.json
+  #         syft "$IMAGE_REF" -o cyclonedx-json=sbom.cyclonedx.json
+
+  #     - name: Upload SBOM artifacts
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: sbom
+  #         path: |
+  #           sbom.spdx.json
+  #           sbom.cyclonedx.json
+  #         retention-days: 30       # keep SBOMs for compliance / audit trails
+
+  # # ── 5. Vulnerability scan with Grype ─────────────────────────────────────
+  # grype-scan:
+  #   name: Vulnerability Scan — Grype
+  #   runs-on: ubuntu-latest
+  #   needs: sbom
+  #   outputs:
+  #     # Expose scan result so the push job can gate on it
+  #     scan-passed: ${{ steps.scan.outcome == 'success' }}
+  #   steps:
+  #     - name: Download SBOM artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: sbom
+
+  #     - name: Install Grype
+  #       uses: anchore/scan-action/download-grype@v6
+
+  #     - name: Scan SBOM with Grype
+  #       id: scan
+  #       uses: anchore/scan-action@v6
+  #       with:
+  #         sbom: sbom.spdx.json
+  #         # Fail on CRITICAL or HIGH vulnerabilities.
+  #         # Adjust threshold to your risk tolerance: critical, high, medium, low, negligible
+  #         fail-build: true
+  #         severity-cutoff: high
+  #         output-format: sarif
+
+  #     - name: Upload Grype SARIF report
+  #       if: always()
+  #       uses: github/codeql-action/upload-sarif@v3
+  #       with:
+  #         sarif_file: results.sarif
+  #         category: grype-sbom
+
+  # # ── 6. Push to GitHub Container Registry (and optionally Docker Hub) ─────
+  # push:
+  #   name: Push Image
+  #   runs-on: ubuntu-latest
+  #   needs: grype-scan
+  #   # Only run on pushes to main AND only when all security checks passed
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   permissions:
+  #     contents: read
+  #     packages: write   # required to push to ghcr.io
+
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+
+  #     - name: Set up Docker Buildx
+  #       uses: docker/setup-buildx-action@v3
+
+  #     - name: Extract Docker metadata
+  #       id: meta
+  #       uses: docker/metadata-action@v5
+  #       with:
+  #         images: |
+  #           ghcr.io/${{ env.IMAGE_NAME }}
+  #           docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+  #         tags: |
+  #           type=sha,prefix=sha-,format=short
+  #           type=ref,event=branch
+  #           type=semver,pattern={{version}}
+  #           type=raw,value=latest,enable={{is_default_branch}}
+
+  #     # ── Login to GitHub Container Registry ──────────────────────────────
+  #     - name: Log in to GHCR
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}   # automatically provided
+
+  #     # ── Login to Docker Hub ──────────────────────────────────────────────
+  #     # Requires DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets in repo settings.
+  #     - name: Log in to Docker Hub
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: docker.io
+  #         username: ${{ secrets.DOCKERHUB_USERNAME }}
+  #         password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  #     - name: Build and push to registries
+  #       uses: docker/build-push-action@v6
+  #       with:
+  #         context: .
+  #         push: true
+  #         tags: ${{ steps.meta.outputs.tags }}
+  #         labels: ${{ steps.meta.outputs.labels }}
+  #         cache-from: type=gha
+  #         cache-to: type=gha,mode=max
+  #         # Attach the SBOM and provenance to the image manifest (OCI standard)
+  #         sbom: true
+  #         provenance: mode=max
