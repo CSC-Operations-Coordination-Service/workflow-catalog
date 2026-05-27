@@ -2,6 +2,21 @@
 ## Workflows
 All workflows created (must be in `.github/workflows/`) are listed below in their own sections with details on their use.
 
+### Docker Security Pipeline
+This workflow's pipeline executes the following steps:
+1. Verify the Dockerfile with Checkov
+2. Build the Docker image 
+3. Generate the Docker image's Software Bill of Materials (SBOM) using Syft
+4. Store the SBOM as an artifact
+5. Scan the SBOM using Grype
+6. Push the image to GitHub as a repository package (if `main` branch, or `docker-security-pipeline branch`)
+7. Push the image to DockerHub (`main` branch only)
+
+The following points should be noted:
+- In order to execute the pipeline, the Dockerfile should be in the root directory of the repository
+- For steps 1 or 5, should either scan fail, the pipeline will stop at that step 
+- In order to push to DockerHub, the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` variables must be set in the repository's Secrets on GitHub (via Settings tab on repository). `DOCKERHUB_TOKEN` is Personal Access Token (PAT) which is generated via Account Settings > Security > New Access Token on DockerHub (with Read & Write permissions)
+
 ### gitleaks
 Requires a license from [gitleaks.io](https://gitleaks.io/). This license must be added as a GitHub secret under the name '`GITLEAKS_LICENSE`' which, if required across multiple repositories, should be an organisation-level secret (see [here](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-an-organization) for details on how to create). Currently on the workflow-catalog repository, a secret has been created at the repository level for testing (creation method can be found [here](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-a-repository)).
 
