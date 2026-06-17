@@ -25,7 +25,7 @@ jobs:
 
             - name: Check connectivity with curl
               env:
-                  SONAR_URL: http://sonarqube:9000
+                  SONAR_URL: http://127.0.0.1:9000
               run: |
                   echo "Checking SonarQube availability at $SONAR_URL"
 
@@ -34,7 +34,7 @@ jobs:
 
             - name: Validate SonarQube status
               run: |
-                  STATUS=$(curl -s http://sonarqube:9000/api/system/status | jq -r '.status')
+                  STATUS=$(curl -s http://127.0.0.1:9000/api/system/status | jq -r '.status')
                   echo "SonarQube status: $STATUS"
 
                   if [ "$STATUS" != "UP" ]; then
