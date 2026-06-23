@@ -4,7 +4,7 @@ on:
     workflow_dispatch:
     push:
         branches:
-            - "ci/*"
+            - "develop"
 
 jobs:
     build:
@@ -18,9 +18,6 @@ jobs:
               env:
                   SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
                   SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-              with:
-                  args: >
-                      -Dsonar.projectKey=test-workflow-catalog
             # If you wish to fail your job when the Quality Gate is red, uncomment the
             # following lines. This would typically be used to fail a deployment.
             # - uses: SonarSource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b # v1.2.0
