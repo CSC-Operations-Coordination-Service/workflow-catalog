@@ -4,6 +4,16 @@ on:
   push:
 
 jobs:
+  docker-test:
+    runs-on: self-hosted
+    steps:
+      - name: Docker debug
+        run: |
+          whoami
+          id
+          ls -l /var/run/docker.sock
+          docker version
+
   python-test:
     runs-on: self-hosted
 
