@@ -29,17 +29,13 @@ jobs:
     runs-on: self-hosted
     container:
       image: python:3.11
+      options: --add-host=host.docker.internal:host-gateway
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      # - name: Install system dependencies
-      #   run: |
-      #     apt-get update
-      #     apt-get install -y libsqlite3-0
 
       - name: Set up Python
         uses: actions/setup-python@v4
