@@ -2,7 +2,8 @@ name: Python Tests
 
 on:
   push:
-
+    branches:
+      - "develop"
 # jobs:
 #   docker-test:
 #     runs-on: self-hosted
