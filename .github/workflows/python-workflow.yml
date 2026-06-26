@@ -3,59 +3,60 @@ name: Python Tests
 on:
   push:
 
-jobs:
-  docker-test:
-    runs-on: self-hosted
-    steps:
-      - name: Docker debug
-        run: |
-          whoami
-          id
-          ls -l /var/run/docker.sock
-          docker version
-
-  python-test:
-    runs-on: self-hosted
-
-    container:
-      image: python:3.11
-
-    steps:
-      - uses: actions/checkout@v4
-      - run: python --version
-
 # jobs:
+#   docker-test:
+#     runs-on: self-hosted
+#     steps:
+#       - name: Docker debug
+#         run: |
+#           whoami
+#           id
+#           ls -l /var/run/docker.sock
+#           docker version
+
 #   python-test:
 #     runs-on: self-hosted
-#     container: ubuntu-22.04
+
+#     container:
+#       image: python:3.11
 
 #     steps:
 #       - uses: actions/checkout@v4
+#       - run: python --version
 
-#       - name: Set up Python
-#         uses: actions/setup-python@v4
-#         with:
-#           python-version: "3.11.11"
-#           architecture: x64
+jobs:
+  python-test:
+    runs-on: self-hosted
+    container:
+      image: ubuntu-22.04
 
-#       - name: Install tox
-#         run: pip install tox
+    steps:
+      - uses: actions/checkout@v4
 
-#       - name: Run tests
-#         run: tox
-#         working-directory: python-demo
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11.11"
+          architecture: x64
 
-#       - name: SonarQube Scan
-#         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
-#         env:
-#           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-#           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      - name: Install tox
+        run: pip install tox
 
-#       - name: Upload artifacts
-#         if: always()
-#         uses: actions/upload-artifact@v4
-#         with:
-#           name: reports
-#           path: |
-#             python-demo/coverage.xml
-#             python-demo/pytest-report.xml
+      - name: Run tests
+        run: tox
+        working-directory: python-demo
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            python-demo/coverage.xml
+            python-demo/pytest-report.xml
