@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+#
+# Mode 1 — "local": install the wheel produced by a local/CI build.
+# In the pipeline the wheel is handed over via actions/upload-artifact +
+# download-artifact; locally just run `tox -e build` first.
+# The `dist/` directory is expected to be present in the build context.
+#
+FROM python:3.11-slim AS runtime
+
+# Don't write .pyc files / buffer stdout (better container logs).
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Bring in the pre-built distribution and install it.
+COPY dist/ /tmp/dist/
+RUN pip install --no-cache-dir /tmp/dist/*.whl \
+    && rm -rf /tmp/dist
+
+# Run as a non-root user.
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
+# `python-demo` is the console_scripts entry point declared in setup.cfg.
+# CMD holds a placeholder argument for the Fibonacci demo — replace it with
+# your real service invocation.
+ENTRYPOINT ["python-demo"]
+CMD ["10"]

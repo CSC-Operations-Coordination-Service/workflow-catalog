@@ -1,0 +1,164 @@
+name: Docker build (reusable)
+
+# Generic, language-agnostic build-and-push workflow.
+# The caller supplies everything project-specific (context, Dockerfile,
+# artifact, build args). Pass secrets with `secrets: inherit`; this workflow
+# reads these repository secrets (dev/prod chosen via the `environment` input):
+#   NEXUS_DOCKER_REGISTRY_DEV / NEXUS_DOCKER_REGISTRY_PROD,
+#   NEXUS_USERNAME, NEXUS_PASSWORD,
+#   NEXUS_PYPI_INDEX_URL_DEV / NEXUS_PYPI_INDEX_URL_PROD (only when mount-pip-index: true),
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Image repository name (without registry/owner prefix)"
+        required: true
+        type: string
+      context:
+        description: "Docker build context"
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile"
+        required: true
+        type: string
+      artifact-name:
+        description: "Artifact to download before building (empty = none)"
+        required: false
+        type: string
+        default: ""
+      artifact-path:
+        description: "Where to extract the downloaded artifact"
+        required: false
+        type: string
+        default: "."
+      build-args:
+        description: "Newline-separated build args forwarded to build-push-action"
+        required: false
+        type: string
+        default: ""
+      release:
+        description: "true = semver + latest tags; false = branch + sha tags"
+        required: false
+        type: boolean
+        default: false
+      push-to-ghcr:
+        required: false
+        type: boolean
+        default: false
+      push-to-dockerhub:
+        required: false
+        type: boolean
+        default: false
+      mount-pip-index:
+        description: "Mount the context's Nexus PyPI index as the `pip_index_url` build secret"
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: "Target context: 'dev' or 'prod'. Selects which Nexus registry/index secrets are used."
+        required: false
+        type: string
+        default: "dev"
+
+jobs:
+  docker:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write # required to push to GHCR
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        if: inputs.artifact-name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-path }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve Nexus registry for context
+        # Pick the dev or prod Docker registry based on the `environment` input.
+        run: |
+          if [ "${{ inputs.environment }}" = "prod" ]; then
+            echo "NEXUS_DOCKER_REGISTRY=${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}" >> "$GITHUB_ENV"
+          else
+            echo "NEXUS_DOCKER_REGISTRY=${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to Nexus Docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.NEXUS_DOCKER_REGISTRY }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.push-to-ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: inputs.push-to-dockerhub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose image list
+        id: images
+        run: |
+          {
+            echo "list<<EOF"
+            echo "${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}"
+            if [ "${{ inputs.push-to-ghcr }}" = "true" ]; then
+              echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
+            fi
+            if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
+              echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata (dev)
+        id: meta_dev
+        if: ${{ !inputs.release }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.list }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+
+      - name: Docker metadata (release)
+        id: meta_release
+        if: ${{ inputs.release }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.list }}
+          flavor: |
+            latest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ inputs.mount-pip-index && format('pip_index_url={0}', inputs.environment == 'prod' && secrets.NEXUS_PYPI_INDEX_URL_PROD || secrets.NEXUS_PYPI_INDEX_URL_DEV) || '' }}
+          tags: ${{ steps.meta_dev.outputs.tags || steps.meta_release.outputs.tags }}
+          labels: ${{ steps.meta_dev.outputs.labels || steps.meta_release.outputs.labels }}

@@ -1,29 +1,11 @@
-name: Python Tests
+name: Python CI/CD
 
 on:
   push:
     branches:
       - "develop"
-# jobs:
-#   docker-test:
-#     runs-on: self-hosted
-#     steps:
-#       - name: Docker debug
-#         run: |
-#           whoami
-#           id
-#           ls -l /var/run/docker.sock
-#           docker version
-
-#   python-test:
-#     runs-on: self-hosted
-
-#     container:
-#       image: python:3.11
-
-#     steps:
-#       - uses: actions/checkout@v4
-#       - run: python --version
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+" # release tags (x.y.z) trigger the registry-based image + public registries
 
 jobs:
   python-test:
@@ -37,6 +19,20 @@ jobs:
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Select Nexus context (dev/prod) config
+        # Release tags (refs/tags/*) -> prod repos; everything else -> dev.
+        # Loads the context pip.conf (pull/install) and the single committed
+        # .pypirc, then points twine at the matching named server (nexus-dev /
+        # nexus-prod). Credentials are NOT in these files — they come from
+        # secrets at runtime.
+        run: |
+          if ${{ startsWith(github.ref, 'refs/tags/') }}; then CTX=prod; else CTX=dev; fi
+          echo "Using '$CTX' Nexus context"
+          cp "python-demo/ci/pip.$CTX.conf" "$HOME/pip.conf"
+          cp "python-demo/ci/.pypirc" "$HOME/.pypirc"
+          echo "PIP_CONFIG_FILE=$HOME/pip.conf" >> "$GITHUB_ENV"
+          echo "TWINE_REPOSITORY=nexus-$CTX" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -52,17 +48,116 @@ jobs:
         working-directory: python-demo
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTHON_DEMO: "0.0.0" # This is to bypass git folder missing
+
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      - name: Upload artifacts
-        if: always()
+  # ---------------------------------------------------------------------------
+  # Build the wheel/sdist, expose it as an artifact for the next job, and
+  # publish it to the Nexus PyPI repository.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: python-test
+    runs-on: self-hosted
+    container:
+      image: python:3.11
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so setuptools_scm computes the real version
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Select Nexus context (dev/prod) config
+        # Release tags (refs/tags/*) -> prod repos; everything else -> dev.
+        # Loads the context pip.conf (pull/install) and the single committed
+        # .pypirc, then points twine at the matching named server (nexus-dev /
+        # nexus-prod). Credentials are NOT in these files — they come from
+        # secrets at runtime.
+        run: |
+          if ${{ startsWith(github.ref, 'refs/tags/') }}; then CTX=prod; else CTX=dev; fi
+          echo "Using '$CTX' Nexus context"
+          cp "python-demo/ci/pip.$CTX.conf" "$HOME/pip.conf"
+          cp "python-demo/ci/.pypirc" "$HOME/.pypirc"
+          echo "PIP_CONFIG_FILE=$HOME/pip.conf" >> "$GITHUB_ENV"
+          echo "TWINE_REPOSITORY=nexus-$CTX" >> "$GITHUB_ENV"
+
+      - name: Install tox
+        run: pip install tox setuptools_scm
+
+      - name: Resolve version
+        id: version
+        working-directory: python-demo
+        run: echo "version=$(python -m setuptools_scm)" >> "$GITHUB_OUTPUT"
+
+      - name: Build distribution
+        run: tox -e build
+        working-directory: python-demo
+
+      - name: Upload dist artifact
         uses: actions/upload-artifact@v4
         with:
-          name: reports
-          path: |
-            python-demo/coverage.xml
-            python-demo/pytest-report.xml
+          name: dist
+          path: python-demo/dist/
+          if-no-files-found: error
+
+      - name: Publish to Nexus
+        # tox publishes to the server named in TWINE_REPOSITORY (set above to
+        # nexus-dev / nexus-prod), resolved against ~/.pypirc. Credentials come
+        # from the env vars below, not the committed file.
+        run: tox -e publish
+        working-directory: python-demo
+        env:
+          TWINE_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+  # ---------------------------------------------------------------------------
+  # Image build — MODE 1 (local): from the artifact built above.
+  # Runs on develop pushes; pushes to the Nexus Docker registry.
+  # ---------------------------------------------------------------------------
+  docker-local:
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image-name: python-demo
+      context: python-demo
+      dockerfile: python-demo/Dockerfile.local
+      artifact-name: dist
+      artifact-path: python-demo/dist/
+      environment: dev
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Image build — MODE 2 (registry): from the package published to Nexus.
+  # Runs on release tags; pushes to Nexus + GHCR + Docker Hub.
+  # ---------------------------------------------------------------------------
+  docker-registry:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image-name: python-demo
+      context: python-demo
+      dockerfile: python-demo/Dockerfile.registry
+      build-args: |
+        PACKAGE_VERSION=${{ needs.build.outputs.version }}
+      release: true
+      push-to-ghcr: true
+      push-to-dockerhub: true
+      mount-pip-index: true
+      environment: prod
+    secrets: inherit

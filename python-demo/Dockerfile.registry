@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+#
+# Mode 2 — "registry": download the package that was published to the Nexus
+# PyPI repository and install it by version. No build context / wheel needed.
+#
+# The index URL (which may embed credentials) is passed as a BuildKit secret
+# so it is NOT baked into any image layer or `docker history`.
+#
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Exact version to install, e.g. "0.1.2". Provided by the pipeline.
+ARG PACKAGE_VERSION
+
+WORKDIR /app
+
+# `pip_index_url` secret = full Nexus PyPI simple index, e.g.
+#   https://user:pass@nexus.example.com/repository/pypi-group/simple
+RUN --mount=type=secret,id=pip_index_url \
+    pip install --no-cache-dir \
+        --index-url "$(cat /run/secrets/pip_index_url)" \
+        "python-demo==${PACKAGE_VERSION}"
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
+ENTRYPOINT ["python-demo"]
+CMD ["10"]
