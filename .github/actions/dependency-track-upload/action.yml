@@ -1,0 +1,57 @@
+name: "Dependency-Track SBOM upload"
+description: >
+  Upload a CycloneDX SBOM to a Dependency-Track server. Language/tool-agnostic:
+  any job that has produced a CycloneDX file can call this to publish it.
+
+inputs:
+  bom-file:
+    description: "Path to the CycloneDX SBOM file to upload"
+    required: true
+  project-name:
+    description: "Dependency-Track project name (kept stable across releases)"
+    required: true
+  project-version:
+    description: "Dependency-Track project version (usually the release version)"
+    required: true
+  server-url:
+    description: "Base URL of the Dependency-Track API server (no trailing /api)"
+    required: true
+  api-key:
+    description: "Dependency-Track API key (needs BOM_UPLOAD + PROJECT_CREATION_UPLOAD)"
+    required: true
+  autocreate:
+    description: "Create the project/version automatically if it does not exist"
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Upload SBOM to Dependency-Track
+      shell: bash
+      env:
+        DT_SERVER_URL: ${{ inputs.server-url }}
+        DT_API_KEY: ${{ inputs.api-key }}
+        DT_PROJECT_NAME: ${{ inputs.project-name }}
+        DT_PROJECT_VERSION: ${{ inputs.project-version }}
+        DT_AUTOCREATE: ${{ inputs.autocreate }}
+        DT_BOM_FILE: ${{ inputs.bom-file }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$DT_BOM_FILE" ]; then
+          echo "::error::SBOM file not found: $DT_BOM_FILE"
+          exit 1
+        fi
+
+        echo "Uploading '$DT_BOM_FILE' to Dependency-Track project" \
+             "'$DT_PROJECT_NAME' version '$DT_PROJECT_VERSION'"
+
+        curl -sSf -X POST "${DT_SERVER_URL%/}/api/v1/bom" \
+          -H "X-Api-Key: ${DT_API_KEY}" \
+          -F "autoCreate=${DT_AUTOCREATE}" \
+          -F "projectName=${DT_PROJECT_NAME}" \
+          -F "projectVersion=${DT_PROJECT_VERSION}" \
+          -F "bom=@${DT_BOM_FILE}"
+
+        echo "SBOM upload accepted by Dependency-Track."

@@ -1,0 +1,49 @@
+name: "Cosign image signing"
+description: >
+  Sign one or more pushed image references with Cosign using a key-based
+  keypair (no keyless/OIDC). Each reference is signed by digest so the
+  signature is bound to the exact image that was built. The runner must already
+  be logged in to the target registries (Cosign reuses the Docker credentials).
+
+inputs:
+  images:
+    description: "Newline-separated list of image references to sign (registry/name, no tag/digest)"
+    required: true
+  digest:
+    description: "Image digest to sign (e.g. sha256:...), same across every reference"
+    required: true
+  private-key:
+    description: "Cosign encrypted private key (the contents of cosign.key)"
+    required: true
+  password:
+    description: "Password that decrypts the Cosign private key"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    - name: Sign image references by digest
+      shell: bash
+      env:
+        COSIGN_PRIVATE_KEY: ${{ inputs.private-key }}
+        COSIGN_PASSWORD: ${{ inputs.password }}
+        DIGEST: ${{ inputs.digest }}
+        IMAGES: ${{ inputs.images }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$DIGEST" ]; then
+          echo "::error::No image digest provided; nothing to sign."
+          exit 1
+        fi
+
+        while IFS= read -r ref; do
+          [ -n "$ref" ] || continue
+          echo "Signing ${ref}@${DIGEST}"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${ref}@${DIGEST}"
+        done <<< "$IMAGES"
+
+        echo "Cosign signing complete."

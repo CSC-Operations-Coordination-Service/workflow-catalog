@@ -1,0 +1,223 @@
+name: Node CI (reusable)
+
+# Generic, project-agnostic Node.js CI workflow — the Node counterpart of the
+# Python pipeline. Callers reference it with `uses:` and supply everything
+# project-specific via inputs. Pass secrets with `secrets: inherit`.
+#
+# Pipeline: install -> lint -> build -> test -> (optional npm SBOM -> Dependency-Track)
+#           -> (optional Docker image via docker-build.yml).
+#
+# Secrets consumed (only when the matching feature is enabled; provided via
+# `secrets: inherit` from the caller):
+#   DEPENDENCYTRACK_URL / DEPENDENCYTRACK_API_KEY   (generate-sbom)
+#   NEXUS_DOCKER_REGISTRY_DEV / _PROD, NEXUS_USERNAME, NEXUS_PASSWORD,
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN             (build-image)
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Project directory containing package.json"
+        required: true
+        type: string
+      node-version:
+        description: "Node.js major version / image tag (e.g. '22')"
+        required: false
+        type: string
+        default: "22"
+      runs-on:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "self-hosted"
+
+      # --- pipeline steps (each individually toggleable) ------------------
+      install-command:
+        description: "Dependency install command"
+        required: false
+        type: string
+        default: "npm ci"
+      run-lint:
+        required: false
+        type: boolean
+        default: true
+      lint-command:
+        required: false
+        type: string
+        default: "npm run lint"
+      run-build:
+        required: false
+        type: boolean
+        default: true
+      build-command:
+        required: false
+        type: string
+        default: "npm run build"
+      run-tests:
+        required: false
+        type: boolean
+        default: false
+      test-command:
+        required: false
+        type: string
+        default: "npm test"
+      build-env:
+        description: "Newline-separated KEY=VALUE pairs exported before build/test (e.g. CI build defaults)"
+        required: false
+        type: string
+        default: ""
+
+      # --- SBOM (CycloneDX npm -> Dependency-Track) -----------------------
+      generate-sbom:
+        required: false
+        type: boolean
+        default: false
+      sbom-project-name:
+        description: "Dependency-Track project name (defaults to the package name)"
+        required: false
+        type: string
+        default: ""
+      sbom-project-version:
+        description: "Dependency-Track project version (usually the release version)"
+        required: false
+        type: string
+        default: ""
+
+      # --- Docker image (delegates to the reusable docker-build.yml) ------
+      build-image:
+        required: false
+        type: boolean
+        default: false
+      image-name:
+        required: false
+        type: string
+        default: ""
+      dockerfile:
+        required: false
+        type: string
+        default: ""
+      docker-context:
+        required: false
+        type: string
+        default: "."
+      docker-build-args:
+        required: false
+        type: string
+        default: ""
+      docker-release:
+        description: "true = semver + latest tags; false = branch + sha tags"
+        required: false
+        type: boolean
+        default: false
+      push-to-ghcr:
+        required: false
+        type: boolean
+        default: false
+      push-to-dockerhub:
+        required: false
+        type: boolean
+        default: false
+      docker-environment:
+        description: "'dev' or 'prod' — selects which Nexus registry secrets docker-build.yml uses"
+        required: false
+        type: string
+        default: "dev"
+      sign-image:
+        description: "Sign the pushed image digest with Cosign (key-based). Needs COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Release builds only."
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  node-ci:
+    runs-on: ${{ inputs.runs-on }}
+    container:
+      image: node:${{ inputs.node-version }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        working-directory: ${{ github.workspace }}
+
+      - name: Cache npm
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ~/.npm
+          key: npm-${{ inputs.working-directory }}-${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            npm-${{ inputs.working-directory }}-
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
+
+      - name: Export build env
+        if: inputs.build-env != ''
+        run: |
+          printf '%s\n' "${{ inputs.build-env }}" | while IFS= read -r line; do
+            [ -n "$line" ] && echo "$line" >> "$GITHUB_ENV"
+          done
+        working-directory: ${{ github.workspace }}
+
+      - name: Lint
+        if: inputs.run-lint
+        run: ${{ inputs.lint-command }}
+
+      - name: Build
+        if: inputs.run-build
+        run: ${{ inputs.build-command }}
+
+      - name: Test
+        if: inputs.run-tests
+        run: ${{ inputs.test-command }}
+
+      # --- SBOM: CycloneDX npm inventory -> Dependency-Track --------------
+      - name: Generate CycloneDX SBOM
+        if: inputs.generate-sbom
+        run: npx --yes @cyclonedx/cyclonedx-npm --output-format json --output-file sbom-npm.cdx.json
+
+      - name: Upload SBOM artifact
+        if: inputs.generate-sbom
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: sbom-${{ inputs.image-name != '' && inputs.image-name || 'node' }}-package
+          path: ${{ inputs.working-directory }}/sbom-npm.cdx.json
+          if-no-files-found: error
+
+      - name: Upload SBOM to Dependency-Track
+        if: inputs.generate-sbom
+        uses: ./.github/actions/dependency-track-upload
+        with:
+          bom-file: ${{ inputs.working-directory }}/sbom-npm.cdx.json
+          project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || inputs.image-name }}
+          project-version: ${{ inputs.sbom-project-version }}
+          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+
+  # ---------------------------------------------------------------------------
+  # Optional image build — reuses the language-agnostic docker-build.yml.
+  # ---------------------------------------------------------------------------
+  docker:
+    needs: node-ci
+    if: inputs.build-image
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image-name: ${{ inputs.image-name }}
+      context: ${{ inputs.docker-context }}
+      dockerfile: ${{ inputs.dockerfile }}
+      build-args: ${{ inputs.docker-build-args }}
+      release: ${{ inputs.docker-release }}
+      push-to-ghcr: ${{ inputs.push-to-ghcr }}
+      push-to-dockerhub: ${{ inputs.push-to-dockerhub }}
+      environment: ${{ inputs.docker-environment }}
+      generate-sbom: ${{ inputs.generate-sbom }}
+      sbom-project-name: ${{ inputs.image-name != '' && format('{0}-image', inputs.image-name) || '' }}
+      sbom-project-version: ${{ inputs.sbom-project-version }}
+      sign-image: ${{ inputs.sign-image }}
+    secrets: inherit

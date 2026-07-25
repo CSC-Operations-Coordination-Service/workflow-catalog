@@ -1,9 +1,13 @@
 # Required GitHub Secrets
 
-These secrets power [`python-workflow.yml`](workflows/python-workflow.yml) and the
-reusable [`docker-build.yml`](workflows/docker-build.yml). Add them under
+These secrets power the reusable workflows in this catalog — e.g.
+[`python-ci.yml`](workflows/python-ci.yml), [`sbom.yml`](workflows/sbom.yml),
+[`docker-build.yml`](workflows/docker-build.yml),
+[`node-workflow.yml`](workflows/node-workflow.yml) — and their callers such as
+[`python-demo.yml`](workflows/python-demo.yml). Add them under
 **Settings → Secrets and variables → Actions → Repository secrets** (or at the
-organization level so they're shared across repos).
+organization level so they're shared across repos). See the
+[catalog overview](../docs/README.md) for how the pieces fit together.
 
 The workflow picks **dev** vs **prod** automatically from the trigger:
 
@@ -54,12 +58,49 @@ Used when `push-to-dockerhub: true` (release tags).
 | `DOCKERHUB_USERNAME` | Docker Hub username. |
 | `DOCKERHUB_TOKEN` | Docker Hub access token (not your password). |
 
+## Cosign (image signing)
+
+Used by `docker-build.yml` when `sign-image: true` (release builds only). Key-based
+signing — generate the keypair once with `cosign generate-key-pair`, then publish
+`cosign.pub` so consumers can verify. See
+[docs/security-scanning.md](../docs/security-scanning.md).
+
+| Secret | Description |
+| --- | --- |
+| `COSIGN_PRIVATE_KEY` | Contents of the encrypted `cosign.key` private key. |
+| `COSIGN_PASSWORD` | Password that decrypts the Cosign private key. |
+
 ## SonarQube
 
 | Secret | Description |
 | --- | --- |
 | `SONAR_TOKEN` | SonarQube analysis token. |
 | `SONAR_HOST_URL` | SonarQube server URL. |
+
+## Dependency-Track (SBOM upload)
+
+Consumed by [`sbom.yml`](workflows/sbom.yml), by `docker-build.yml` when
+`generate-sbom: true`, and by `node-workflow.yml` when `generate-sbom: true`.
+See [docs/sbom-dependency-track.md](../docs/sbom-dependency-track.md).
+
+| Secret | Description |
+| --- | --- |
+| `DEPENDENCYTRACK_URL` | Base URL of the Dependency-Track API server (no trailing `/api`), reachable from the runners. |
+| `DEPENDENCYTRACK_API_KEY` | Team API key with `BOM_UPLOAD` + `PROJECT_CREATION_UPLOAD` + `VIEW_PORTFOLIO`. |
+
+## Gitleaks (secret scanning)
+
+Consumed by [`gitleaks.yml`](workflows/gitleaks.yml). See
+[docs/security-scanning.md](../docs/security-scanning.md).
+
+| Secret | Description |
+| --- | --- |
+| `GITLEAKS_LICENSE` | Required by `gitleaks-action` on **organization** repos (free for personal repos). Get a key at <https://gitleaks.io> and add it as an **organization** secret so every repo shares it. |
+
+> The `docker-build.yml` scanners — Checkov (`scan-dockerfile`), Grype
+> (`scan-image`) and Dockle (`lint-image`) — need **no new secret**: Checkov
+> runs offline, and Grype and Dockle reuse the Nexus registry login already
+> configured for the image push.
 
 ## Provided automatically — no setup
 
@@ -77,5 +118,10 @@ Used when `push-to-dockerhub: true` (release tags).
 - [ ] `NEXUS_PYPI_INDEX_URL_PROD`
 - [ ] `DOCKERHUB_USERNAME`
 - [ ] `DOCKERHUB_TOKEN`
+- [ ] `COSIGN_PRIVATE_KEY` (only when `sign-image: true`)
+- [ ] `COSIGN_PASSWORD` (only when `sign-image: true`)
 - [ ] `SONAR_TOKEN`
 - [ ] `SONAR_HOST_URL`
+- [ ] `DEPENDENCYTRACK_URL`
+- [ ] `DEPENDENCYTRACK_API_KEY`
+- [ ] `GITLEAKS_LICENSE` (org-level; gitleaks on organization repos)

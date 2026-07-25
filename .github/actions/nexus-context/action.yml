@@ -1,0 +1,40 @@
+name: "Nexus context setup"
+description: >
+  Configure pip (install/pull) and twine (publish) for a Nexus context.
+  Copies the committed context pip.conf and the shared .pypirc into $HOME and
+  exports PIP_CONFIG_FILE + TWINE_REPOSITORY. Credentials are NOT handled here —
+  pass them at runtime via twine's TWINE_USERNAME / TWINE_PASSWORD env vars.
+
+inputs:
+  context:
+    description: "Nexus context to use: 'dev' or 'prod'"
+    required: true
+  config-dir:
+    description: "Directory holding pip.<context>.conf and .pypirc"
+    required: false
+    default: "python-demo/ci"
+
+outputs:
+  context:
+    description: "The resolved context (echoes the input, for convenience)"
+    value: ${{ inputs.context }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Load Nexus ${{ inputs.context }} config
+      shell: bash
+      env:
+        CTX: ${{ inputs.context }}
+        CONFIG_DIR: ${{ inputs.config-dir }}
+      run: |
+        set -euo pipefail
+        if [ "$CTX" != "dev" ] && [ "$CTX" != "prod" ]; then
+          echo "::error::nexus-context: 'context' must be 'dev' or 'prod' (got '$CTX')"
+          exit 1
+        fi
+        echo "Using '$CTX' Nexus context from '$CONFIG_DIR'"
+        cp "$CONFIG_DIR/pip.$CTX.conf" "$HOME/pip.conf"
+        cp "$CONFIG_DIR/.pypirc" "$HOME/.pypirc"
+        echo "PIP_CONFIG_FILE=$HOME/pip.conf" >> "$GITHUB_ENV"
+        echo "TWINE_REPOSITORY=nexus-$CTX" >> "$GITHUB_ENV"

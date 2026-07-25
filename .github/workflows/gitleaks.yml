@@ -1,0 +1,50 @@
+name: Gitleaks secret scan
+
+# Secret scanning with Gitleaks — catches committed credentials before they
+# reach a released image or package ("shift-left" security).
+#
+# Dual-purpose, on purpose:
+#   * workflow_call  → reusable primitive; other repos call it with `uses:` and
+#                      pass `secrets: inherit` (mirrors the rest of the catalog).
+#   * push / pull_request / workflow_dispatch → guards THIS repo directly, so the
+#                      catalog dogfoods its own scanner (no separate caller needed).
+#
+# Secrets consumed:
+#   GITLEAKS_LICENSE — REQUIRED by gitleaks-action on *organization* repos
+#                      (free for personal repos). Get a key at https://gitleaks.io
+#                      and store it as an organization secret so every repo shares
+#                      it. See .github/SECRETS.md.
+#   GITHUB_TOKEN     — provided automatically by Actions.
+#
+# gitleaks-action reads the triggering event to scope the scan: the pushed commit
+# range on `push`, the PR commits on `pull_request`, and the full history on
+# `workflow_dispatch`. Local pre-commit scanning is available too — see
+# .pre-commit-config.yaml and docs/security-scanning.md.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "self-hosted"
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gitleaks:
+    runs-on: ${{ inputs.runs-on || 'self-hosted' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # full history so every commit is scanned
+
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

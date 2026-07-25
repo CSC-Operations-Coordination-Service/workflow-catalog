@@ -1,0 +1,128 @@
+name: Python CI (reusable)
+
+# Reusable test + build + publish pipeline for a Nexus-backed Python package.
+#
+# Flow: test (pytest + SonarQube) -> build (wheel/sdist, publish to Nexus).
+# The Nexus context is chosen automatically: release tags (refs/tags/*) use the
+# 'prod' repos, everything else uses 'dev'.
+#
+# Pass secrets with `secrets: inherit`. Consumes these repository secrets:
+#   NEXUS_USERNAME, NEXUS_PASSWORD   (publish to Nexus PyPI)
+#   SONAR_TOKEN, SONAR_HOST_URL      (SonarQube scan)
+#
+# Outputs:
+#   version — the setuptools_scm version resolved for this ref.
+
+on:
+  workflow_call:
+    inputs:
+      project-dir:
+        description: "Directory containing the package (tox.ini, setup.cfg, ci/)"
+        required: false
+        type: string
+        default: "python-demo"
+      python-version:
+        description: "Python version for the build/test containers"
+        required: false
+        type: string
+        default: "3.11"
+      publish:
+        description: "Publish the built distribution to Nexus PyPI"
+        required: false
+        type: boolean
+        default: true
+      pretend-version:
+        description: "setuptools_scm fallback version for the test job (no git history there)"
+        required: false
+        type: string
+        default: "0.0.0"
+    outputs:
+      version:
+        description: "Resolved package version (setuptools_scm)"
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  test:
+    runs-on: self-hosted
+    container:
+      image: python:${{ inputs.python-version }}
+      options: --add-host=host.docker.internal:host-gateway
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Nexus context
+        uses: ./.github/actions/nexus-context
+        with:
+          context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+          config-dir: ${{ inputs.project-dir }}/ci
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Run tests
+        run: tox
+        working-directory: ${{ inputs.project-dir }}
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTHON_DEMO: ${{ inputs.pretend-version }}
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  build:
+    needs: test
+    runs-on: self-hosted
+    container:
+      image: python:${{ inputs.python-version }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # full history + tags so setuptools_scm computes the real version
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Nexus context
+        uses: ./.github/actions/nexus-context
+        with:
+          context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+          config-dir: ${{ inputs.project-dir }}/ci
+
+      - name: Install tox
+        run: pip install tox setuptools_scm
+
+      - name: Resolve version
+        id: version
+        working-directory: ${{ inputs.project-dir }}
+        run: echo "version=$(python -m setuptools_scm)" >> "$GITHUB_OUTPUT"
+
+      - name: Build distribution
+        run: tox -e build
+        working-directory: ${{ inputs.project-dir }}
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: dist
+          path: ${{ inputs.project-dir }}/dist/
+          if-no-files-found: error
+
+      - name: Publish to Nexus
+        if: inputs.publish
+        # tox publishes to the server named in TWINE_REPOSITORY (set by
+        # nexus-context to nexus-dev / nexus-prod), resolved against ~/.pypirc.
+        # Credentials come from the env vars below, not the committed file.
+        run: tox -e publish
+        working-directory: ${{ inputs.project-dir }}
+        env:
+          TWINE_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}

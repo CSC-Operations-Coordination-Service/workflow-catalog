@@ -1,0 +1,24 @@
+version: 2
+
+updates:
+  # Keep pinned action SHAs (workflows + composite actions) up to date. With the
+  # SHA-pinning convention, Dependabot bumps the SHA and updates the `# vX.Y.Z`
+  # comment, so the security benefit of pinning doesn't cost manual maintenance.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Python dependencies for the demo package.
+  - package-ecosystem: "pip"
+    directory: "/python-demo"
+    schedule:
+      interval: "weekly"
+    groups:
+      python:
+        patterns:
+          - "*"

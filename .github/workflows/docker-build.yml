@@ -7,7 +7,8 @@ name: Docker build (reusable)
 #   NEXUS_DOCKER_REGISTRY_DEV / NEXUS_DOCKER_REGISTRY_PROD,
 #   NEXUS_USERNAME, NEXUS_PASSWORD,
 #   NEXUS_PYPI_INDEX_URL_DEV / NEXUS_PYPI_INDEX_URL_PROD (only when mount-pip-index: true),
-#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
+#   COSIGN_PRIVATE_KEY, COSIGN_PASSWORD (only when sign-image: true, release builds)
 
 on:
   workflow_call:
@@ -63,6 +64,66 @@ on:
         required: false
         type: string
         default: "dev"
+      generate-sbom:
+        description: "Generate a CycloneDX SBOM from the built image and upload it to Dependency-Track"
+        required: false
+        type: boolean
+        default: false
+      sbom-project-name:
+        description: "Dependency-Track project name for the image SBOM (defaults to '<image-name>-image')"
+        required: false
+        type: string
+        default: ""
+      sbom-project-version:
+        description: "Dependency-Track project version for the image SBOM (usually the release version)"
+        required: false
+        type: string
+        default: ""
+      scan-dockerfile:
+        description: "Lint the Dockerfile for misconfigurations with Checkov before building"
+        required: false
+        type: boolean
+        default: false
+      scan-dockerfile-soft-fail:
+        description: "Report Checkov findings without failing the build (true = warn only)"
+        required: false
+        type: boolean
+        default: false
+      scan-image:
+        description: "Scan the pushed image for vulnerabilities with Grype (fails per scan-severity-cutoff)"
+        required: false
+        type: boolean
+        default: false
+      scan-severity-cutoff:
+        description: "Lowest severity that fails the build: negligible|low|medium|high|critical"
+        required: false
+        type: string
+        default: "high"
+      scan-fail-build:
+        description: "Fail the job when a vulnerability at/above scan-severity-cutoff is found (false = report only)"
+        required: false
+        type: boolean
+        default: true
+      lint-image:
+        description: "Lint the built image against CIS / hardening best practices with Dockle"
+        required: false
+        type: boolean
+        default: false
+      lint-image-failure-threshold:
+        description: "Dockle level that fails the build: INFO|WARN|FATAL"
+        required: false
+        type: string
+        default: "WARN"
+      lint-image-fail-build:
+        description: "Fail the job when Dockle findings reach the threshold (false = report only)"
+        required: false
+        type: boolean
+        default: true
+      sign-image:
+        description: "Sign the pushed image digest with Cosign (key-based). Needs COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Release builds only."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   docker:
@@ -72,17 +133,32 @@ jobs:
       packages: write # required to push to GHCR
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Dockerfile IaC lint — Checkov checks the Dockerfile for security
+      # misconfigurations (missing USER / HEALTHCHECK, unpinned base image, etc.)
+      # before anything is built or pushed, so a bad Dockerfile fails fast. Set
+      # scan-dockerfile-soft-fail to warn instead of block. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Lint Dockerfile (Checkov)
+        if: inputs.scan-dockerfile
+        uses: bridgecrewio/checkov-action@d9d1e5cdc53e3a91f0c4c58db7bc19ee31cac7e5 # v12.3113.0
+        with:
+          file: ${{ inputs.dockerfile }}
+          framework: dockerfile
+          soft_fail: ${{ inputs.scan-dockerfile-soft-fail }}
+          output_format: cli
 
       - name: Download artifact
         if: inputs.artifact-name != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.artifact-path }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
       - name: Resolve Nexus registry for context
         # Pick the dev or prod Docker registry based on the `environment` input.
@@ -94,7 +170,7 @@ jobs:
           fi
 
       - name: Log in to Nexus Docker registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.NEXUS_DOCKER_REGISTRY }}
           username: ${{ secrets.NEXUS_USERNAME }}
@@ -102,7 +178,7 @@ jobs:
 
       - name: Log in to GitHub Container Registry
         if: inputs.push-to-ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -110,7 +186,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: inputs.push-to-dockerhub
-        uses: docker/login-action@v3
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -133,7 +209,7 @@ jobs:
       - name: Docker metadata (dev)
         id: meta_dev
         if: ${{ !inputs.release }}
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         with:
           images: ${{ steps.images.outputs.list }}
           tags: |
@@ -143,7 +219,7 @@ jobs:
       - name: Docker metadata (release)
         id: meta_release
         if: ${{ inputs.release }}
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         with:
           images: ${{ steps.images.outputs.list }}
           flavor: |
@@ -153,7 +229,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
@@ -162,3 +239,108 @@ jobs:
           secrets: ${{ inputs.mount-pip-index && format('pip_index_url={0}', inputs.environment == 'prod' && secrets.NEXUS_PYPI_INDEX_URL_PROD || secrets.NEXUS_PYPI_INDEX_URL_DEV) || '' }}
           tags: ${{ steps.meta_dev.outputs.tags || steps.meta_release.outputs.tags }}
           labels: ${{ steps.meta_dev.outputs.labels || steps.meta_release.outputs.labels }}
+
+      # -----------------------------------------------------------------------
+      # SBOM — generate a CycloneDX inventory of the pushed image (OS packages +
+      # interpreter + installed wheels) and publish it to Dependency-Track.
+      # Syft pulls the image by digest from the Nexus registry (already logged in
+      # above). Language-agnostic: any caller passing generate-sbom gets this.
+      # -----------------------------------------------------------------------
+      - name: Generate image SBOM (CycloneDX)
+        if: inputs.generate-sbom
+        uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb # v0.17.7
+        with:
+          image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom-image.cdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM artifact
+        if: inputs.generate-sbom
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: sbom-${{ inputs.image-name }}-image
+          path: sbom-image.cdx.json
+          if-no-files-found: error
+
+      - name: Upload image SBOM to Dependency-Track
+        if: inputs.generate-sbom
+        uses: ./.github/actions/dependency-track-upload
+        with:
+          bom-file: sbom-image.cdx.json
+          project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || format('{0}-image', inputs.image-name) }}
+          project-version: ${{ inputs.sbom-project-version }}
+          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+
+      # -----------------------------------------------------------------------
+      # Vulnerability scan — Grype scans the pushed image against its CVE DB and
+      # fails the build when something at or above `scan-severity-cutoff` is
+      # found. Grype pulls the image by digest from the Nexus registry (already
+      # logged in above) and catalogs it itself, so this is independent of the
+      # SBOM feature above. Runs after the SBOM upload so the inventory is
+      # recorded even when the gate trips. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Scan image for vulnerabilities (Grype)
+        id: scan
+        if: inputs.scan-image
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          fail-build: ${{ inputs.scan-fail-build }}
+          severity-cutoff: ${{ inputs.scan-severity-cutoff }}
+          output-format: sarif
+
+      - name: Upload Grype scan report (SARIF)
+        # Runs whether the scan passed or tripped the gate, so the report is
+        # always kept; skipped only when scanning is off or the job is cancelled.
+        if: ${{ !cancelled() && inputs.scan-image }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: grype-${{ inputs.image-name }}-scan
+          path: ${{ steps.scan.outputs.sarif }}
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Image hardening lint — Dockle checks the pushed image against the CIS
+      # Docker Benchmark and best practices (non-root, no setuid/setgid, no
+      # secrets/credentials baked into layers, cleared package caches, ...).
+      # Complements Checkov (Dockerfile source) and Grype (CVEs) by inspecting
+      # the actual image layers. Runs natively on the runner and pulls by digest
+      # through the docker socket, reusing the Nexus login above. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Lint image hardening (Dockle)
+        id: lint
+        if: inputs.lint-image
+        uses: erzz/dockle-action@e8a7c41f36f1236ca3282b298d425ffbfdb2e922 # v1.4.1
+        with:
+          image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          report-format: sarif
+          report-name: dockle-report
+          failure-threshold: ${{ inputs.lint-image-failure-threshold }}
+          exit-code: ${{ inputs.lint-image-fail-build && '1' || '0' }}
+
+      - name: Upload Dockle report (SARIF)
+        if: ${{ !cancelled() && inputs.lint-image }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: dockle-${{ inputs.image-name }}-report
+          path: dockle-report.sarif
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Image signing — Cosign (key-based) signs every pushed reference by
+      # digest, so consumers (or a Kubernetes admission controller) can verify
+      # the image was built by this CI and has not been tampered with:
+      #   cosign verify --key cosign.pub <registry>/<image>@<digest>
+      # Gated to release builds; reuses the registry logins established above.
+      # Needs the COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Sign image (Cosign)
+        if: ${{ inputs.sign-image && inputs.release }}
+        uses: ./.github/actions/cosign-sign
+        with:
+          images: ${{ steps.images.outputs.list }}
+          digest: ${{ steps.build.outputs.digest }}
+          private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          password: ${{ secrets.COSIGN_PASSWORD }}

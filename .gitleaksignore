@@ -1,0 +1,19 @@
+# Gitleaks false-positive allowlist
+
+#
+
+# Each line is the *fingerprint* of a finding to ignore, in the form
+
+# <file>:<rule-id>:<line>       e.g.  README.md:generic-api-key:27
+
+#
+
+# Get a fingerprint from the "Fingerprint:" field of the gitleaks failure output
+
+# (locally via the pre-commit hook, or from the CI job log), then paste it here
+
+# Keep this list short and justify each entry — it is an allowlist for real
+
+# scanner hits. See docs/security-scanning.md
+
+docs/gitleaks.md:generic-api-key:27
