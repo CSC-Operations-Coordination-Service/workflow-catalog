@@ -6,6 +6,9 @@ description: >
   substituting the ${NEXUS_HOST} / ${NEXUS_PORT} placeholders from secrets, and
   exports PIP_CONFIG_FILE + TWINE_REPOSITORY.
 
+  The action ships embedded templates under its own root, so callers can use
+  the default config-dir and avoid storing pip/.pypirc templates in every repo.
+
   Committed config holds no host and no credentials. At runtime:
     - host/port come from the nexus-host / nexus-port inputs (pip and twine
       cannot expand env vars inside their own config files).
@@ -19,9 +22,9 @@ inputs:
     description: "Nexus context to use: 'dev' or 'prod'"
     required: true
   config-dir:
-    description: "Directory holding pip.<context>.conf and .pypirc"
+    description: "Directory holding pip.<context>.conf and .pypirc, relative to the action root."
     required: false
-    default: "python-demo/ci"
+    default: "."
   nexus-host:
     description: >
       Nexus hostname, no scheme and no port — pass the NEXUS_HOST secret.

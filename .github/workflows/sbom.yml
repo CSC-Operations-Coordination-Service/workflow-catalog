@@ -57,7 +57,6 @@ jobs:
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ inputs.context }}
-          config-dir: ${{ inputs.project-dir }}/ci
           nexus-host: ${{ secrets.NEXUS_HOST }}
           nexus-port: ${{ secrets.NEXUS_PORT }}
           nexus-username: ${{ secrets.NEXUS_USERNAME }}
