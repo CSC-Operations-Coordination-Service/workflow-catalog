@@ -86,6 +86,11 @@ runs:
           esac
         fi
 
+        # Resolve relative config-dir paths from the action root, not the caller repo.
+        if [ -n "${GITHUB_ACTION_PATH:-}" ] && [ "${CONFIG_DIR#/}" = "${CONFIG_DIR}" ]; then
+          CONFIG_DIR="$GITHUB_ACTION_PATH/$CONFIG_DIR"
+        fi
+
         # sed replacement text is not literal: escape / and & in the values.
         esc() { printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'; }
         host_esc=$(esc "$NEXUS_HOST")
