@@ -16,16 +16,33 @@ The workflow picks **dev** vs **prod** automatically from the trigger:
 | push to `develop` (and any non-tag ref) | `dev` |
 | push of a release tag `x.y.z` | `prod` |
 
-URLs live in committed config files ([`ci/.pypirc`](../python-demo/ci/.pypirc),
-[`ci/pip.*.conf`](../python-demo/ci/)); **only credentials and host-specific
-values belong in secrets.**
+Repository **paths** live in committed config files
+([`ci/.pypirc`](../python-demo/ci/.pypirc), [`ci/pip.*.conf`](../python-demo/ci/)),
+which carry `${NEXUS_HOST}` / `${NEXUS_PORT}` placeholders; **the host, port and
+all credentials come from secrets.** Neither pip nor twine expands variables
+inside its own config file, so the
+[`nexus-context`](actions/nexus-context/action.yml) action substitutes the
+placeholders while rendering those files into `$HOME`.
+
+## Nexus — location
+
+| Secret | Used by | Description |
+| --- | --- | --- |
+| `NEXUS_HOST` | `nexus-context` (pip + twine config) | Bare hostname — **no scheme, no port, no path**, e.g. `oep-sysma-mondb-02.ocs.local`. Also becomes the `machine` entry in the generated `~/.netrc`. |
+| `NEXUS_PORT` | `nexus-context` (pip + twine config) | Port only, e.g. `8081`. Leave unset for the scheme default (80/443) — the `:<port>` is then dropped from the URL. |
 
 ## Nexus — shared credentials
 
 | Secret | Used by | Description |
 | --- | --- | --- |
-| `NEXUS_USERNAME` | twine publish, Docker login | Nexus account username (same for dev & prod). |
-| `NEXUS_PASSWORD` | twine publish, Docker login | Nexus account password / token. |
+| `NEXUS_USERNAME` | pip (`~/.netrc`), twine publish, Docker login | Nexus account username (same for dev & prod). |
+| `NEXUS_PASSWORD` | pip (`~/.netrc`), twine publish, Docker login | Nexus account password / token. |
+
+> pip has no username/password environment variables, so index **reads** are
+> authenticated with a `~/.netrc` that `nexus-context` generates at runtime
+> (mode `0600`, never committed). The `machine` line holds the bare host with
+> **no port** — pip strips the port before looking up the entry, so a
+> `machine host:port` line silently never matches.
 
 ## Nexus — Docker registry (per context)
 
@@ -110,6 +127,8 @@ Consumed by [`gitleaks.yml`](workflows/gitleaks.yml). See
 
 ## Quick checklist
 
+- [ ] `NEXUS_HOST`
+- [ ] `NEXUS_PORT`
 - [ ] `NEXUS_USERNAME`
 - [ ] `NEXUS_PASSWORD`
 - [ ] `NEXUS_DOCKER_REGISTRY_DEV`

@@ -189,7 +189,7 @@ jobs:
 
       - name: Upload SBOM to Dependency-Track
         if: inputs.generate-sbom
-        uses: ./.github/actions/dependency-track-upload
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
         with:
           bom-file: ${{ inputs.working-directory }}/sbom-npm.cdx.json
           project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || inputs.image-name }}

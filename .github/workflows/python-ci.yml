@@ -7,7 +7,8 @@ name: Python CI (reusable)
 # 'prod' repos, everything else uses 'dev'.
 #
 # Pass secrets with `secrets: inherit`. Consumes these repository secrets:
-#   NEXUS_USERNAME, NEXUS_PASSWORD   (publish to Nexus PyPI)
+#   NEXUS_HOST, NEXUS_PORT           (rendered into ~/pip.conf and ~/.pypirc)
+#   NEXUS_USERNAME, NEXUS_PASSWORD   (pip reads via ~/.netrc + twine publish)
 #   SONAR_TOKEN, SONAR_HOST_URL      (SonarQube scan)
 #
 # Outputs:
@@ -55,10 +56,14 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Nexus context
-        uses: ./.github/actions/nexus-context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
           config-dir: ${{ inputs.project-dir }}/ci
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
 
       - name: Install tox
         run: pip install tox
@@ -92,10 +97,14 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Nexus context
-        uses: ./.github/actions/nexus-context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
           config-dir: ${{ inputs.project-dir }}/ci
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
 
       - name: Install tox
         run: pip install tox setuptools_scm

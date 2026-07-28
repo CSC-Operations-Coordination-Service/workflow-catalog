@@ -54,10 +54,14 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set up Nexus context
-        uses: ./.github/actions/nexus-context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ inputs.context }}
           config-dir: ${{ inputs.project-dir }}/ci
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
 
       - name: Download dist artifact
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
@@ -86,7 +90,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload package SBOM to Dependency-Track
-        uses: ./.github/actions/dependency-track-upload
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
         with:
           bom-file: ${{ inputs.project-dir }}/sbom-python.cdx.json
           project-name: ${{ inputs.project-name }}

@@ -265,7 +265,7 @@ jobs:
 
       - name: Upload image SBOM to Dependency-Track
         if: inputs.generate-sbom
-        uses: ./.github/actions/dependency-track-upload
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
         with:
           bom-file: sbom-image.cdx.json
           project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || format('{0}-image', inputs.image-name) }}
@@ -338,7 +338,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Sign image (Cosign)
         if: ${{ inputs.sign-image && inputs.release }}
-        uses: ./.github/actions/cosign-sign
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/cosign-sign@develop
         with:
           images: ${{ steps.images.outputs.list }}
           digest: ${{ steps.build.outputs.digest }}
