@@ -50,6 +50,43 @@ jobs:
       options: --add-host=host.docker.internal:host-gateway
 
     steps:
+      # Preflight the SonarQube credentials before doing any work: the scan
+      # action only *warns* when SONAR_TOKEN is empty, so a missing or stale
+      # secret otherwise surfaces much later as a bare HTTP 401 from the
+      # scanner bootstrap ("Failed to query server version").
+      - name: Check SonarQube URL and token
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ -n "$SONAR_HOST_URL" ] || fail "SONAR_HOST_URL is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list."
+          [ -n "$SONAR_TOKEN" ] || fail "SONAR_TOKEN is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list."
+
+          case "$SONAR_HOST_URL" in
+            http://*|https://*) ;;
+            *) fail "SONAR_HOST_URL must start with http:// or https://" ;;
+          esac
+          case "$SONAR_HOST_URL" in
+            */) fail "SONAR_HOST_URL must not end with a slash — the scanner appends /api/... to it." ;;
+          esac
+
+          # Safe to print: the value stays masked, only its length is revealed.
+          # A SonarQube token is 44 chars (squ_ + 40); more means stray whitespace.
+          echo "SONAR_TOKEN length: ${#SONAR_TOKEN}"
+
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            -H "Authorization: Bearer $SONAR_TOKEN" \
+            "$SONAR_HOST_URL/api/v2/analysis/version" || true)
+
+          case "${code:-000}" in
+            200) echo "SonarQube reachable, token accepted." ;;
+            401|403) fail "SonarQube rejected the token (HTTP $code). It is expired, revoked, or left over from a previous server — regenerate it and update the secret." ;;
+            000) fail "Cannot reach $SONAR_HOST_URL from the runner (DNS, routing or proxy)." ;;
+            *) fail "Unexpected HTTP $code from SonarQube — expected 200." ;;
+          esac
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Mark workspace as safe for git
