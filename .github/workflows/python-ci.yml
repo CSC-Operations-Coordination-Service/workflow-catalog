@@ -114,7 +114,12 @@ jobs:
         run: tox
         working-directory: ${{ inputs.project-dir }}
         env:
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PYTHON_DEMO: ${{ inputs.pretend-version }}
+          # Unsuffixed on purpose. The *_FOR_<DIST> form is matched against the
+          # dist name, so it silently stops applying for any caller whose
+          # project-dir is not python-demo, and it is ignored outright wherever
+          # the dist name is unknown (e.g. the `python -m setuptools_scm` CLI,
+          # which does not read `name` from setup.cfg).
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.pretend-version }}
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
@@ -150,14 +155,51 @@ jobs:
       - name: Install tox
         run: pip install tox setuptools_scm
 
+      # setuptools_scm derives the version from git metadata, so an unusable work
+      # tree otherwise surfaces as a bare "unable to detect version" LookupError
+      # out of a PEP 517 backend two steps later. Check it where the cause is
+      # still visible.
+      - name: Check git metadata for setuptools_scm
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          command -v git >/dev/null 2>&1 || fail "git is missing from the python:${{ inputs.python-version }} container. actions/checkout then falls back to a REST API tarball, which carries no .git, and setuptools_scm cannot resolve a version from it."
+
+          git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$PWD is not part of a usable git work tree: $(git status 2>&1 | tr '\n' ' ')"
+
+          # Note: the toplevel is the repository root, not this directory —
+          # python-demo/ has no .git of its own, which is why the package sets
+          # search_parent_directories in [tool.setuptools_scm].
+          echo "toplevel: $(git rev-parse --show-toplevel)"
+          echo "HEAD:     $(git rev-parse --short HEAD)"
+          echo "tags:     $(git tag --list | wc -l)"
+          echo "describe: $(git describe --tags --always --dirty 2>&1)"
+
       - name: Resolve version
         id: version
         working-directory: ${{ inputs.project-dir }}
-        run: echo "version=$(python -m setuptools_scm)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+
+          # Deliberately not `echo "version=$(python -m setuptools_scm)"`: the
+          # exit status of a command substitution inside echo is discarded, so
+          # that form kept this step green when setuptools_scm failed and
+          # exported an empty version — breaking the build step below and every
+          # consumer of the `version` output.
+          version=$(python -m setuptools_scm)
+          [ -n "$version" ] || { echo "::error::setuptools_scm resolved an empty version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
 
       - name: Build distribution
         run: tox -e build
         working-directory: ${{ inputs.project-dir }}
+        env:
+          # The PEP 517 backend runs in build's own isolated venv; hand it the
+          # version resolved above rather than making it re-derive one, so the
+          # artifact version and the `version` output cannot diverge.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Upload dist artifact
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
