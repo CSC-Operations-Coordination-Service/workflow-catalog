@@ -72,9 +72,15 @@ jobs:
             */) fail "SONAR_HOST_URL must not end with a slash — the scanner appends /api/... to it." ;;
           esac
 
-          # Safe to print: the value stays masked, only its length is revealed.
-          # A SonarQube token is 44 chars (squ_ + 40); more means stray whitespace.
-          echo "SONAR_TOKEN length: ${#SONAR_TOKEN}"
+          # Safe to print: a length and a truncated hash reveal nothing usable,
+          # but let you compare against the token you meant to store:
+          #   printf '%s' "$SONAR_TOKEN" | sha256sum | cut -c1-12
+          # A SonarQube token is 44 chars (sqa_/sqp_/squ_ + 40); more means
+          # stray whitespace crept into the secret.
+          echo "SONAR_TOKEN length: ${#SONAR_TOKEN}, sha256: $(printf '%s' "$SONAR_TOKEN" | sha256sum | cut -c1-12)"
+
+          # Identifies which SonarQube answered, without echoing the URL secret.
+          echo "server: $(curl -sS -m 20 "$SONAR_HOST_URL/api/system/status" || echo unreachable)"
 
           code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
             -H "Authorization: Bearer $SONAR_TOKEN" \
