@@ -125,6 +125,22 @@ Consumed by [`gitleaks.yml`](workflows/gitleaks.yml). See
 | --- | --- |
 | `GITHUB_TOKEN` | Injected by GitHub Actions. Used to push to GHCR when `push-to-ghcr: true`. The workflow already requests `packages: write` permission. |
 
+## Verifying what CI actually receives
+
+Adding a secret and *delivering* it are different things. Run **Actions →
+Connectivity check** ([`connectivity-check.yml`](workflows/connectivity-check.yml))
+to probe every component above from the runner and print a length plus a
+truncated SHA-256 of each secret, so you can confirm the value that arrives is
+the one you stored — see [connectivity-check.md](../docs/connectivity-check.md).
+
+Two traps that look identical to a wrong password:
+
+- **Precedence.** Repository secrets override organization ones, and environment
+  secrets override both. Editing the org copy changes nothing while a stale
+  repository copy exists.
+- **Access list.** An organization secret scoped to *Selected repositories* that
+  omits this repo arrives as an **empty string**, with no warning.
+
 ## Quick checklist
 
 - [ ] `NEXUS_HOST`

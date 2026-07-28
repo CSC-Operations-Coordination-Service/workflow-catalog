@@ -48,6 +48,7 @@ composite actions            nexus-context        dependency-track-upload
 | [`docker-build.yml`](../.github/workflows/docker-build.yml) | primitive | Language-agnostic **image build + push** (Nexus / GHCR / Docker Hub) with optional image SBOM → Dependency-Track, optional **Checkov** Dockerfile lint (`scan-dockerfile`), **Grype** CVE gate (`scan-image`), **Dockle** image-hardening lint (`lint-image`), and **Cosign** image signing (`sign-image`, release builds). |
 | [`gitleaks.yml`](../.github/workflows/gitleaks.yml) | primitive | **Secret scanning** with Gitleaks. Dual-triggered: `workflow_call` (reusable) **and** `push`/`pull_request`/`workflow_dispatch` (guards this repo). |
 | [`node-workflow.yml`](../.github/workflows/node-workflow.yml) | all-in-one | Node/React **install → lint → build → test**, with optional npm SBOM and image build via toggles. |
+| [`connectivity-check.yml`](../.github/workflows/connectivity-check.yml) | diagnostic | **Preflight every component** the catalog talks to — SonarQube, Nexus (PyPI + Docker connectors), Dependency-Track, Docker Hub, internet egress. Run it manually when a pipeline fails on a 401/403. See [connectivity-check.md](connectivity-check.md). |
 
 ### Callers
 

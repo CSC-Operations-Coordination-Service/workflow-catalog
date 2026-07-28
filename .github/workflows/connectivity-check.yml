@@ -1,0 +1,436 @@
+name: Connectivity check
+
+# One-shot preflight for every component the catalog talks to:
+#   SonarQube · Nexus (PyPI + Docker connectors) · Dependency-Track ·
+#   Docker Hub · internet egress
+#
+# Why this exists: a missing, stale or shadowed secret otherwise surfaces deep
+# inside a build as an opaque 401/403. Each check here names the component, the
+# HTTP status and the likely cause, and prints a *truncated sha256* of every
+# secret so you can compare it against the value you meant to store — without
+# ever revealing it. See docs/connectivity-check.md.
+#
+# Every check runs even when an earlier one fails, so a single run tells the
+# whole story; the final step writes a summary table and fails the job if any
+# required check failed.
+#
+# Runs on a self-hosted runner inside python:3.11 — the same vantage point as
+# the real pipelines, so DNS, routing and proxy behaviour match what they see.
+# Internal components are queried with `--noproxy '*'` (they live on the OCS
+# network); only the egress checks are allowed through the proxy.
+#
+# Consumes, via `secrets: inherit` when called:
+#   SONAR_HOST_URL, SONAR_TOKEN
+#   NEXUS_HOST, NEXUS_PORT, NEXUS_USERNAME, NEXUS_PASSWORD
+#   NEXUS_DOCKER_REGISTRY_DEV, NEXUS_DOCKER_REGISTRY_PROD
+#   DEPENDENCYTRACK_URL, DEPENDENCYTRACK_API_KEY
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN          (optional — release path only)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  # GitHub only shows the "Run workflow" button once this file is on the default
+  # branch, so while it lives on ci/connectivity-check a push is the only way to
+  # run it. Drop this trigger when merging.
+  push:
+    branches:
+      - ci/connectivity-check
+  # Uncomment for a weekly heartbeat on the whole toolchain:
+  # schedule:
+  #   - cron: "0 6 * * 1"
+
+jobs:
+  connectivity:
+    runs-on: self-hosted
+    container:
+      image: python:3.11
+      # Lets the Docker-registry check reach a loopback registry address, which
+      # from inside this container would otherwise mean the container itself.
+      options: --add-host=host.docker.internal:host-gateway
+
+    steps:
+      - name: Write shared helpers
+        run: |
+          cat > /tmp/checks.sh <<'SH'
+          # Sourced by every check below. Container jobs run under `sh -e`, so
+          # this is POSIX shell — no bashisms.
+          rc=0
+          err()  { echo "::error::$1"; rc=1; }
+          warn() { echo "::warning::$1"; }
+          note() { echo "::notice::$1"; }
+          ok()   { echo "  ok — $1"; }
+
+          # Truncated hash of a secret: not reversible, not masked, and directly
+          # comparable with, on the machine holding the real value:
+          #   printf '%s' "$VALUE" | sha256sum | cut -c1-12
+          fp() { printf '%s' "$1" | sha256sum | cut -c1-12; }
+
+          # Describe a secret without revealing it.
+          shape() {
+            if [ -z "$2" ]; then
+              echo "  $1: MISSING"
+            else
+              echo "  $1: len=$(printf '%s' "$2" | wc -c | tr -d ' ') sha256=$(fp "$2")"
+            fi
+          }
+
+          require() {
+            if [ -z "$2" ]; then
+              err "$1 is not set. Add it as a repository or organization secret; for an org secret, check this repo is in its access list. Note repository secrets override organization ones."
+            fi
+          }
+
+          # Internal components live on the OCS network: never route them through
+          # the egress proxy, even if HTTP_PROXY appears in the environment.
+          # A short connect timeout keeps a filtered port (the classic Docker
+          # connector symptom) from burning the whole read timeout.
+          icode() { curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' --connect-timeout 5 -m 20 "$@" || true; }
+          ibody() { curl -sS --noproxy '*' --connect-timeout 5 -m 20 "$@" || true; }
+          # Internet: must go through the proxy when one is configured.
+          ecode() { curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 -m 30 "$@" || true; }
+          SH
+          echo "helpers written to /tmp/checks.sh"
+
+      # Fingerprints every secret in one place. On its own this catches the
+      # commonest failure: editing one copy of a secret while CI is delivered
+      # another (precedence is environment > repository > organization, and the
+      # Actions / Codespaces / Dependabot tabs are separate stores).
+      - name: Secret inventory
+        id: secrets
+        continue-on-error: true
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          NEXUS_PORT: ${{ secrets.NEXUS_PORT }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_DOCKER_REGISTRY_DEV: ${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}
+          NEXUS_DOCKER_REGISTRY_PROD: ${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}
+          DEPENDENCYTRACK_URL: ${{ secrets.DEPENDENCYTRACK_URL }}
+          DEPENDENCYTRACK_API_KEY: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          . /tmp/checks.sh
+          echo "required:"
+          shape SONAR_HOST_URL "$SONAR_HOST_URL"
+          shape SONAR_TOKEN "$SONAR_TOKEN"
+          shape NEXUS_HOST "$NEXUS_HOST"
+          shape NEXUS_PORT "$NEXUS_PORT"
+          shape NEXUS_USERNAME "$NEXUS_USERNAME"
+          shape NEXUS_PASSWORD "$NEXUS_PASSWORD"
+          shape NEXUS_DOCKER_REGISTRY_DEV "$NEXUS_DOCKER_REGISTRY_DEV"
+          shape NEXUS_DOCKER_REGISTRY_PROD "$NEXUS_DOCKER_REGISTRY_PROD"
+          shape DEPENDENCYTRACK_URL "$DEPENDENCYTRACK_URL"
+          shape DEPENDENCYTRACK_API_KEY "$DEPENDENCYTRACK_API_KEY"
+          echo "optional (release path):"
+          shape DOCKERHUB_USERNAME "$DOCKERHUB_USERNAME"
+          shape DOCKERHUB_TOKEN "$DOCKERHUB_TOKEN"
+          exit 0
+
+      - name: SonarQube
+        id: sonarqube
+        continue-on-error: true
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          . /tmp/checks.sh
+          require SONAR_HOST_URL "$SONAR_HOST_URL"
+          require SONAR_TOKEN "$SONAR_TOKEN"
+          [ "$rc" = 0 ] || exit 1
+
+          case "$SONAR_HOST_URL" in
+            http://*|https://*) ;;
+            *) err "SONAR_HOST_URL must start with http:// or https://" ;;
+          esac
+          case "$SONAR_HOST_URL" in
+            */) err "SONAR_HOST_URL must not end with a slash — the scanner appends /api/... to it" ;;
+          esac
+          [ "$rc" = 0 ] || exit 1
+
+          # Anonymous, and identifies the instance without echoing the URL secret.
+          echo "  server: $(ibody "$SONAR_HOST_URL/api/system/status")"
+
+          # The exact call sonar-scanner makes before anything else.
+          c=$(icode -H "Authorization: Bearer $SONAR_TOKEN" "$SONAR_HOST_URL/api/v2/analysis/version")
+          case "$c" in
+            200) ok "scanner bootstrap authenticated" ;;
+            401|403) err "SonarQube rejected SONAR_TOKEN (HTTP $c) — expired, revoked, or issued by a previous server. Compare its sha256 from the inventory with the token you meant to store." ;;
+            000) err "cannot reach SonarQube (DNS, routing or proxy)" ;;
+            *) err "unexpected HTTP $c from /api/v2/analysis/version" ;;
+          esac
+          exit $rc
+
+      - name: Nexus — status and PyPI repositories
+        id: nexus
+        continue-on-error: true
+        env:
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          NEXUS_PORT: ${{ secrets.NEXUS_PORT }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          . /tmp/checks.sh
+          require NEXUS_HOST "$NEXUS_HOST"
+          require NEXUS_USERNAME "$NEXUS_USERNAME"
+          require NEXUS_PASSWORD "$NEXUS_PASSWORD"
+          [ "$rc" = 0 ] || exit 1
+
+          # The same shape rules the nexus-context action enforces, checked here
+          # so a malformed secret fails in seconds instead of at pip/twine time.
+          case "$NEXUS_HOST" in
+            *://*|*:*|*/*) err "NEXUS_HOST must be a bare hostname — no scheme, port or path" ;;
+          esac
+          if [ -n "$NEXUS_PORT" ]; then
+            case "$NEXUS_PORT" in
+              *[!0-9]*) err "NEXUS_PORT must be numeric" ;;
+            esac
+            base="http://$NEXUS_HOST:$NEXUS_PORT"
+          else
+            note "NEXUS_PORT is empty — using the scheme default port, as nexus-context does"
+            base="http://$NEXUS_HOST"
+          fi
+          [ "$rc" = 0 ] || exit 1
+
+          c=$(icode "$base/service/rest/v1/status")
+          if [ "$c" = 200 ]; then
+            ok "Nexus is up"
+          else
+            err "Nexus /service/rest/v1/status returned HTTP $c — service down or unreachable from the runner"
+          fi
+
+          c=$(icode "$base/service/rest/v1/status/writable")
+          if [ "$c" = 200 ]; then
+            ok "Nexus accepts writes (twine publish is not blocked)"
+          else
+            warn "Nexus is not accepting writes (HTTP $c) — reads work but publishing will fail"
+          fi
+
+          # Authenticated read of the group indexes: exactly what pip does.
+          for repo in pypi-dev-group pypi-prod-group; do
+            c=$(icode -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" "$base/repository/$repo/simple/")
+            case "$c" in
+              200) ok "$repo readable — this is pip's index-url" ;;
+              401) err "$repo: Nexus rejected NEXUS_USERNAME/NEXUS_PASSWORD (HTTP 401). Compare their sha256 from the inventory with the credentials you meant to store." ;;
+              403) err "$repo: authenticated but not authorized to read (HTTP 403) — check the CI user's privileges" ;;
+              404) err "$repo: no such repository (HTTP 404) — has provision-repos.sh run against this Nexus?" ;;
+              000) err "$repo: cannot reach Nexus at all" ;;
+              *) err "$repo: unexpected HTTP $c" ;;
+            esac
+          done
+
+          # Twine targets. A read proves the name and the credentials; the upload
+          # itself cannot be tested without publishing something.
+          for repo in pypi-dev pypi-prod; do
+            c=$(icode -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" "$base/repository/$repo/")
+            case "$c" in
+              200) ok "$repo reachable — twine target" ;;
+              401) err "$repo: credentials rejected (HTTP 401)" ;;
+              404) err "$repo: no such repository (HTTP 404)" ;;
+              *) warn "$repo: HTTP $c — browsing a hosted repo is not always permitted; check by hand if twine fails" ;;
+            esac
+          done
+
+          # Which repositories this account can actually see. The listing is
+          # filtered by permission, so it is informational, not a hard gate.
+          names=$(ibody -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" "$base/service/rest/v1/repositories" |
+            python3 -c 'import json,sys; print(" ".join(sorted(r["name"] for r in json.load(sys.stdin))))' 2>/dev/null || true)
+          if [ -n "$names" ]; then
+            echo "  visible repositories: $names"
+          else
+            warn "this account can browse no repositories (the listing is permission-filtered; anonymous sees an empty list)"
+          fi
+          exit $rc
+
+      - name: Nexus — Docker registry connectors
+        id: nexus_docker
+        continue-on-error: true
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_DOCKER_REGISTRY_DEV: ${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}
+          NEXUS_DOCKER_REGISTRY_PROD: ${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}
+        run: |
+          . /tmp/checks.sh
+          require NEXUS_USERNAME "$NEXUS_USERNAME"
+          require NEXUS_PASSWORD "$NEXUS_PASSWORD"
+          [ "$rc" = 0 ] || exit 1
+
+          # $1 = secret name (for messages), $2 = its host:port value
+          check_registry() {
+            if [ -z "$2" ]; then
+              note "$1 is not set — skipping"
+              return 0
+            fi
+            case "$2" in
+              *://*) err "$1 must be host:port with no scheme"; return 0 ;;
+              */*) err "$1 must be host:port with no path"; return 0 ;;
+            esac
+
+            target="$2"
+            case "$2" in
+              127.0.0.1:*|localhost:*)
+                # docker push works with a loopback registry because the daemon
+                # on the runner host resolves it — but inside this container
+                # loopback is the container itself, so probe the host gateway.
+                target="host.docker.internal:${2##*:}"
+                note "$1 points at loopback; probing the host gateway instead, since the daemon (not this container) is what resolves it during a push"
+                ;;
+            esac
+
+            c=$(icode -u "$NEXUS_USERNAME:$NEXUS_PASSWORD" "http://$target/v2/")
+            case "$c" in
+              200) ok "$1: registry API reachable and credentials accepted" ;;
+              401) err "$1: registry rejected the Nexus credentials (HTTP 401) — check the Docker Bearer Token realm is active and 'force basic authentication' is on for the repo" ;;
+              404) err "$1: no Docker registry on that port (HTTP 404) — the connector port must match the repository" ;;
+              000) err "$1: no connection — the Docker connector port must be published and reachable from the runner (this is the Squid / insecure-registries trap; internal hosts need no_proxy)" ;;
+              *) err "$1: unexpected HTTP $c from /v2/" ;;
+            esac
+          }
+
+          check_registry NEXUS_DOCKER_REGISTRY_DEV "$NEXUS_DOCKER_REGISTRY_DEV"
+          check_registry NEXUS_DOCKER_REGISTRY_PROD "$NEXUS_DOCKER_REGISTRY_PROD"
+          exit $rc
+
+      - name: Dependency-Track
+        id: dependency_track
+        continue-on-error: true
+        env:
+          DEPENDENCYTRACK_URL: ${{ secrets.DEPENDENCYTRACK_URL }}
+          DEPENDENCYTRACK_API_KEY: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+        run: |
+          . /tmp/checks.sh
+          require DEPENDENCYTRACK_URL "$DEPENDENCYTRACK_URL"
+          require DEPENDENCYTRACK_API_KEY "$DEPENDENCYTRACK_API_KEY"
+          [ "$rc" = 0 ] || exit 1
+
+          case "$DEPENDENCYTRACK_URL" in
+            http://*|https://*) ;;
+            *) err "DEPENDENCYTRACK_URL must start with http:// or https://" ;;
+          esac
+          case "$DEPENDENCYTRACK_URL" in
+            */api|*/api/) err "DEPENDENCYTRACK_URL must be the base URL without /api — the upload action appends /api/v1/bom itself" ;;
+          esac
+          [ "$rc" = 0 ] || exit 1
+          base="${DEPENDENCYTRACK_URL%/}"
+
+          # Public endpoint: proves we are talking to Dependency-Track and which version.
+          v=$(ibody "$base/api/version")
+          case "$v" in
+            *Dependency-Track*) echo "  server: $v" ;;
+            "") err "no response from /api/version — server down or unreachable from the runner" ;;
+            *) err "/api/version did not look like Dependency-Track — is the URL pointing at the frontend rather than the API?" ;;
+          esac
+
+          # The API key needs VIEW_PORTFOLIO for this, and BOM_UPLOAD +
+          # PROJECT_CREATION_UPLOAD for the SBOM upload itself.
+          c=$(icode -H "X-Api-Key: $DEPENDENCYTRACK_API_KEY" "$base/api/v1/project?limit=1")
+          case "$c" in
+            200) ok "API key accepted, VIEW_PORTFOLIO granted" ;;
+            401) err "Dependency-Track rejected DEPENDENCYTRACK_API_KEY (HTTP 401) — regenerate the team API key and update the secret" ;;
+            403) err "API key authenticated but lacks VIEW_PORTFOLIO (HTTP 403). The upload also needs BOM_UPLOAD and PROJECT_CREATION_UPLOAD." ;;
+            000) err "cannot reach Dependency-Track (DNS, routing or proxy)" ;;
+            *) err "unexpected HTTP $c from /api/v1/project" ;;
+          esac
+          exit $rc
+
+      # Optional: only the release path pushes to Docker Hub, so absent secrets
+      # are a skip, not a failure.
+      - name: Docker Hub
+        id: docker_hub
+        continue-on-error: true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          . /tmp/checks.sh
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            note "Docker Hub credentials not set — skipping (only needed when push-to-dockerhub: true)"
+            exit 0
+          fi
+
+          # The token exchange the docker CLI performs on login/pull.
+          c=$(ecode -u "$DOCKERHUB_USERNAME:$DOCKERHUB_TOKEN" \
+            'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull')
+          case "$c" in
+            200) ok "Docker Hub accepted DOCKERHUB_USERNAME / DOCKERHUB_TOKEN" ;;
+            401) err "Docker Hub rejected the credentials (HTTP 401) — DOCKERHUB_TOKEN must be an access token, not the account password" ;;
+            000) err "cannot reach auth.docker.io — egress proxy blocked or unset" ;;
+            *) err "unexpected HTTP $c from auth.docker.io" ;;
+          esac
+          exit $rc
+
+      - name: Internet egress
+        id: egress
+        continue-on-error: true
+        run: |
+          . /tmp/checks.sh
+          echo "  proxy environment:"
+          env | grep -i -E '^(https?_proxy|no_proxy)=' || echo "    none set (direct egress)"
+
+          # Where sonarqube-scan-action downloads the Sonar Scanner CLI from.
+          c=$(ecode -I https://binaries.sonarsource.com/)
+          if [ "$c" = 200 ]; then
+            ok "binaries.sonarsource.com reachable — the scanner CLI download will work"
+          else
+            err "binaries.sonarsource.com returned HTTP $c — the scan action cannot fetch the scanner CLI"
+          fi
+
+          # Actions and reusable-workflow downloads.
+          c=$(ecode https://api.github.com)
+          if [ "$c" = 200 ]; then
+            ok "api.github.com reachable"
+          else
+            err "api.github.com returned HTTP $c"
+          fi
+
+          # GHCR answers 401 to an unauthenticated /v2/ — that *is* reachability.
+          c=$(ecode https://ghcr.io/v2/)
+          case "$c" in
+            401|200) ok "ghcr.io reachable" ;;
+            000) err "ghcr.io unreachable — push-to-ghcr would fail" ;;
+            *) warn "ghcr.io returned HTTP $c (expected 401)" ;;
+          esac
+          exit $rc
+
+      - name: Summary
+        if: always()
+        env:
+          R_SECRETS: ${{ steps.secrets.outcome }}
+          R_SONARQUBE: ${{ steps.sonarqube.outcome }}
+          R_NEXUS: ${{ steps.nexus.outcome }}
+          R_NEXUS_DOCKER: ${{ steps.nexus_docker.outcome }}
+          R_DTRACK: ${{ steps.dependency_track.outcome }}
+          R_DOCKERHUB: ${{ steps.docker_hub.outcome }}
+          R_EGRESS: ${{ steps.egress.outcome }}
+        run: |
+          results="Secret-inventory:$R_SECRETS SonarQube:$R_SONARQUBE Nexus:$R_NEXUS Nexus-Docker:$R_NEXUS_DOCKER Dependency-Track:$R_DTRACK Docker-Hub:$R_DOCKERHUB Egress:$R_EGRESS"
+
+          {
+            echo "## Connectivity check"
+            echo
+            echo "| Component | Result |"
+            echo "| --- | --- |"
+            for r in $results; do
+              name=$(echo "${r%%:*}" | tr '-' ' ')
+              case "${r#*:}" in
+                success) echo "| $name | ✅ pass |" ;;
+                failure) echo "| $name | ❌ fail |" ;;
+                *) echo "| $name | ⏭️ ${r#*:} |" ;;
+              esac
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=""
+          for r in $results; do
+            case "$r" in
+              *:failure) failed="$failed ${r%%:*}" ;;
+            esac
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failed checks:$failed — see the annotations above for the cause of each"
+            exit 1
+          fi
+          echo "all connectivity checks passed"
