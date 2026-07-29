@@ -66,8 +66,15 @@ jobs:
       insecure-registry: true
       # docker.io is reached through BUILDKIT_HTTP_PROXY rather than a Nexus
       # mirror. Using the mirror instead would need registry-mirror-port set to
-      # whichever group includes the Docker Hub proxy — see docs/security-scanning
-      # notes; that port is not yet confirmed, and a wrong one breaks `FROM`.
+      # whichever group includes the Docker Hub proxy — that port is not yet
+      # confirmed, and a wrong one breaks `FROM`.
+      #
+      # NOT covered by either of the above: the *builder's own* image, which the
+      # runner's docker daemon pulls from Docker Hub before BuildKit exists. If
+      # "Set up Docker Buildx" stalls at "Booting builder", set
+      #   buildkit-image: <nexus-host:port>/moby/buildkit:buildx-stable-1
+      # (or registry-mirror-port, which derives it). See
+      # docs/docker-build-network.md for the three hops and their knobs.
     secrets: inherit
 
   # Release only: build the image from the Nexus package (Mode 2) and push to

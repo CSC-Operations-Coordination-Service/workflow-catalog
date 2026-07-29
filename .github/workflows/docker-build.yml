@@ -85,6 +85,20 @@ on:
         required: false
         type: string
         default: ""
+      buildkit-image:
+        description: >
+          Image the docker-container builder itself runs on, as a full reference —
+          e.g. <nexus-host:port>/moby/buildkit:buildx-stable-1. The runner's docker
+          daemon pulls this while the builder boots, which happens BEFORE
+          buildkitd.toml or the proxy driver-opts below exist, so neither the
+          docker.io mirror nor the proxy applies to it. On a runner whose daemon
+          has no egress this is the pull that hangs the "Set up Docker Buildx"
+          step. Empty = derived from the mirror when one is configured, otherwise
+          Docker Hub's moby/buildkit (needs daemon-level egress). A plain-HTTP
+          source must be in the daemon's own insecure-registries.
+        required: false
+        type: string
+        default: ""
       environment:
         description: "Target context: 'dev' or 'prod'. Selects which Nexus registry/index secrets are used."
         required: false
@@ -275,6 +289,7 @@ jobs:
           MIRROR_INPUT: ${{ inputs.registry-mirror }}
           MIRROR_PORT: ${{ inputs.registry-mirror-port }}
           INSECURE: ${{ inputs.insecure-registry }}
+          BUILDKIT_IMAGE: ${{ inputs.buildkit-image }}
         run: |
           set -euo pipefail
           toml="$RUNNER_TEMP/buildkitd.toml"
@@ -329,8 +344,25 @@ jobs:
           # Prefer the repo/org variable; fall back to an ambient proxy var if
           # the runner exports one. No proxy configured = unchanged behaviour.
           proxy="${PROXY_VAR:-${https_proxy:-${http_proxy:-}}}"
+
+          # The builder runs *on* an image, and the runner's docker daemon pulls
+          # that image before buildkitd.toml or the env driver-opts below take
+          # effect — so a daemon with no egress hangs in "Set up Docker Buildx"
+          # no matter how well BuildKit itself is configured. Serve it from Nexus
+          # whenever we know a Docker Hub proxy path there.
+          if [ -n "$BUILDKIT_IMAGE" ]; then
+            IMAGE=$BUILDKIT_IMAGE
+          elif [ -n "$MIRROR" ]; then
+            IMAGE="$MIRROR/moby/buildkit:buildx-stable-1"
+          else
+            IMAGE=""
+          fi
+
           {
             echo "driver-opts<<EOF"
+            if [ -n "$IMAGE" ]; then
+              echo "image=$IMAGE"
+            fi
             if [ -n "$proxy" ]; then
               echo "env.http_proxy=$proxy"
               echo "env.https_proxy=$proxy"
@@ -347,6 +379,12 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+          if [ -n "$IMAGE" ]; then
+            echo "Builder image: $IMAGE (pulled by the runner's docker daemon)"
+          else
+            echo "::warning::The builder image will be pulled from Docker Hub by the runner's docker daemon. If 'Set up Docker Buildx' hangs or times out at 'Booting builder', that daemon has no egress to registry-1.docker.io — set buildkit-image to a Nexus path such as <host:port>/moby/buildkit:buildx-stable-1."
+          fi
+
           if [ -n "$proxy" ]; then
             echo "BuildKit egress via proxy (bypassing ${NEXUS_DOCKER_REGISTRY%%:*})"
           elif [ -z "$MIRROR" ]; then
@@ -354,6 +392,10 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
+        # Bounded so an unreachable source for the builder image fails in minutes
+        # with the warning above in the log, instead of sitting on the daemon's
+        # pull until the job timeout.
+        timeout-minutes: 8
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
         with:
           buildkitd-config: ${{ steps.buildkit.outputs.config }}

@@ -158,3 +158,4 @@ or open an issue to switch that reference to a full `owner/repo/path@ref` form.
 - [security-scanning.md](security-scanning.md) — Gitleaks secret scanning, Grype image CVE gate & Cosign image signing
 - [node-workflow.md](node-workflow.md) — the Node/React reusable workflow
 - [manual-docker-build-develop.md](manual-docker-build-develop.md) — manual image builds on develop
+- [docker-build-network.md](docker-build-network.md) — the three network hops of an image build on a runner with no internet egress (builder image, `FROM` resolution, push) and which input covers each
