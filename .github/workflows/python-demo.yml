@@ -60,7 +60,14 @@ jobs:
       artifact-name: dist
       artifact-path: python-demo/dist/
       environment: dev
-      insecure-registry: true # Nexus serves the Docker connector over plain HTTP
+      # The dev Docker connector is plain HTTP: an https probe against it fails
+      # with a TLS "packet length too long", and it is listed in the runner's
+      # daemon insecure-registries.
+      insecure-registry: true
+      # docker.io is reached through BUILDKIT_HTTP_PROXY rather than a Nexus
+      # mirror. Using the mirror instead would need registry-mirror-port set to
+      # whichever group includes the Docker Hub proxy — see docs/security-scanning
+      # notes; that port is not yet confirmed, and a wrong one breaks `FROM`.
     secrets: inherit
 
   # Release only: build the image from the Nexus package (Mode 2) and push to
@@ -84,6 +91,9 @@ jobs:
       push-to-dockerhub: true
       mount-pip-index: true
       environment: prod
+      # Left at the defaults: whether the *prod* connector is plain HTTP has not
+      # been verified. If a release build fails at the push with a TLS error, set
+      # insecure-registry: true here as well.
       generate-sbom: true
       sbom-project-name: python-demo-image
       sbom-project-version: ${{ needs.ci.outputs.version }}

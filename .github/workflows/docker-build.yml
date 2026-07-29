@@ -64,6 +64,27 @@ on:
         required: false
         type: boolean
         default: false
+      registry-mirror:
+        description: >
+          Registry to resolve docker.io images through, as a bare host:port — e.g.
+          a Nexus docker proxy/group connector on a different port than the push
+          target. Lets `FROM` and `# syntax=` images come from Nexus instead of
+          Docker Hub, which is the only route on a runner with no internet egress.
+          Empty = pull from Docker Hub directly.
+        required: false
+        type: string
+        default: ""
+      registry-mirror-port:
+        description: >
+          Connector port on the SAME Nexus host as the push target to use as the
+          docker.io mirror — typically a group repo that includes the Docker Hub
+          proxy (a Nexus proxy repo has no connector of its own, so it is only
+          reachable through a group). The host is taken from the registry secret,
+          so nothing internal is hardcoded in the caller. Ignored when
+          registry-mirror is set explicitly.
+        required: false
+        type: string
+        default: ""
       environment:
         description: "Target context: 'dev' or 'prod'. Selects which Nexus registry/index secrets are used."
         required: false
@@ -251,16 +272,55 @@ jobs:
         env:
           PROXY_VAR: ${{ vars.BUILDKIT_HTTP_PROXY }}
           NO_PROXY_VAR: ${{ vars.BUILDKIT_NO_PROXY }}
+          MIRROR_INPUT: ${{ inputs.registry-mirror }}
+          MIRROR_PORT: ${{ inputs.registry-mirror-port }}
+          INSECURE: ${{ inputs.insecure-registry }}
         run: |
           set -euo pipefail
           toml="$RUNNER_TEMP/buildkitd.toml"
-          if [ "${{ inputs.insecure-registry }}" = "true" ]; then
-            printf '[registry."%s"]\n  http = true\n' "$NEXUS_DOCKER_REGISTRY" > "$toml"
-            echo "BuildKit will push to $NEXUS_DOCKER_REGISTRY over plain HTTP"
+          : > "$toml"
+
+          # An explicit host:port wins; otherwise pair the given connector port
+          # with the host from the registry secret.
+          if [ -n "$MIRROR_INPUT" ]; then
+            MIRROR=$MIRROR_INPUT
+          elif [ -n "$MIRROR_PORT" ]; then
+            MIRROR="${NEXUS_DOCKER_REGISTRY%%:*}:$MIRROR_PORT"
           else
-            : > "$toml"
+            MIRROR=""
           fi
+
+          # Registries BuildKit must talk to over plain HTTP rather than TLS.
+          http_regs=""
+          if [ "$INSECURE" = "true" ]; then
+            http_regs="$NEXUS_DOCKER_REGISTRY"
+            echo "BuildKit will push to $NEXUS_DOCKER_REGISTRY over plain HTTP"
+          fi
+
+          # Resolve docker.io through the mirror, so `FROM python:3.11-slim` and
+          # the `# syntax=` frontend are fetched from Nexus. This is what makes a
+          # build work with no internet egress at all, rather than routing Docker
+          # Hub traffic through a proxy.
+          if [ -n "$MIRROR" ]; then
+            printf '[registry."docker.io"]\n  mirrors = ["%s"]\n' "$MIRROR" >> "$toml"
+            echo "BuildKit will resolve docker.io images via $MIRROR"
+            if [ "$INSECURE" = "true" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
+              http_regs="$http_regs $MIRROR"
+            fi
+          fi
+
+          for r in $http_regs; do
+            printf '[registry."%s"]\n  http = true\n' "$r" >> "$toml"
+          done
+
           echo "config=$toml" >> "$GITHUB_OUTPUT"
+          echo "mirror=$MIRROR" >> "$GITHUB_OUTPUT"
+          # A mirror on its own connector needs its own docker login (see below).
+          if [ -n "$MIRROR" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
+            echo "mirror-login=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mirror-login=false" >> "$GITHUB_OUTPUT"
+          fi
 
           # BuildKit inherits neither the host daemon's proxy settings nor the
           # job environment, so resolving `# syntax=` and `FROM` images dials the
@@ -274,19 +334,23 @@ jobs:
             if [ -n "$proxy" ]; then
               echo "env.http_proxy=$proxy"
               echo "env.https_proxy=$proxy"
-              # The Nexus registry itself must bypass the proxy, otherwise the
-              # push is sent to an internet-facing proxy and fails the same way.
-              # Both host and host:port are listed — a no_proxy entry carrying a
-              # port only matches that port.
-              echo "env.no_proxy=${NO_PROXY_VAR:+$NO_PROXY_VAR,}${NEXUS_DOCKER_REGISTRY%%:*},$NEXUS_DOCKER_REGISTRY"
+              # The Nexus registry and the mirror must bypass the proxy, otherwise
+              # their traffic is sent to an internet-facing proxy and fails the
+              # same way. Both host and host:port are listed — a no_proxy entry
+              # carrying a port only matches that port.
+              bypass="${NEXUS_DOCKER_REGISTRY%%:*},$NEXUS_DOCKER_REGISTRY"
+              if [ -n "$MIRROR" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
+                bypass="$bypass,${MIRROR%%:*},$MIRROR"
+              fi
+              echo "env.no_proxy=${NO_PROXY_VAR:+$NO_PROXY_VAR,}$bypass"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
           if [ -n "$proxy" ]; then
             echo "BuildKit egress via proxy (bypassing ${NEXUS_DOCKER_REGISTRY%%:*})"
-          else
-            echo "::warning::No BuildKit proxy configured. If this runner has no direct internet access, resolving '# syntax=' or 'FROM' images will time out — set the BUILDKIT_HTTP_PROXY repository variable."
+          elif [ -z "$MIRROR" ]; then
+            echo "::warning::BuildKit has neither a proxy nor a docker.io mirror. On a runner without direct internet egress, resolving '# syntax=' or 'FROM' images will time out — set registry-mirror-port to a Nexus group connector that includes the Docker Hub proxy, or the BUILDKIT_HTTP_PROXY repository variable."
           fi
 
       - name: Set up Docker Buildx
@@ -299,6 +363,18 @@ jobs:
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.NEXUS_DOCKER_REGISTRY }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      # BuildKit reads registry credentials from the client's docker config, so a
+      # mirror on a different connector than the push target needs its own login —
+      # a Nexus group answers /v2/ with 401 for anonymous pulls, which would fail
+      # the `FROM` resolution just as an unreachable Docker Hub does.
+      - name: Log in to Nexus mirror registry
+        if: steps.buildkit.outputs.mirror-login == 'true'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ steps.buildkit.outputs.mirror }}
           username: ${{ secrets.NEXUS_USERNAME }}
           password: ${{ secrets.NEXUS_PASSWORD }}
 
