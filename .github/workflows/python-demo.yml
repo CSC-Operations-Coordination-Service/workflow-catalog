@@ -60,6 +60,7 @@ jobs:
       artifact-name: dist
       artifact-path: python-demo/dist/
       environment: dev
+      insecure-registry: true # Nexus serves the Docker connector over plain HTTP
     secrets: inherit
 
   # Release only: build the image from the Nexus package (Mode 2) and push to

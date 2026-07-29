@@ -59,6 +59,11 @@ on:
         required: false
         type: boolean
         default: false
+      insecure-registry:
+        description: "Nexus serves the Docker connector over plain HTTP — tell BuildKit to push over HTTP instead of TLS"
+        required: false
+        type: boolean
+        default: false
       environment:
         description: "Target context: 'dev' or 'prod'. Selects which Nexus registry/index secrets are used."
         required: false
@@ -179,17 +184,85 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.artifact-path }}
 
+      # Resolved before Buildx is provisioned, because the BuildKit config below
+      # needs the registry host.
+      - name: Resolve Nexus registry for context
+        # Pick the dev or prod Docker registry based on the `environment` input,
+        # then normalise and validate it. A registry secret carrying a scheme
+        # ("https://host:8082"), a trailing slash, or stray whitespace produces a
+        # tag like "https://host:8082/app:develop", which buildx rejects with a
+        # bare "invalid reference format". GitHub masks the value, so the log
+        # shows only "***/app:develop" and the cause is invisible. Normalise the
+        # usual copy-paste damage and fail here, naming the offending secret,
+        # instead of several steps later on an unreadable error.
+        env:
+          RAW_DEV: ${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}
+          RAW_PROD: ${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            raw=$RAW_PROD
+            name=NEXUS_DOCKER_REGISTRY_PROD
+          else
+            raw=$RAW_DEV
+            name=NEXUS_DOCKER_REGISTRY_DEV
+          fi
+
+          if [ -z "$raw" ]; then
+            echo "::error::$name is empty or unset. Set it to a bare host:port — no scheme, no path — e.g. nexus.example.local:8082"
+            exit 1
+          fi
+
+          reg=$(printf '%s' "$raw" | tr -d '[:space:]')
+          reg=${reg#http://}
+          reg=${reg#https://}
+          while [ "${reg%/}" != "$reg" ]; do reg=${reg%/}; done
+
+          # Image references must be lowercase; an uppercase host is another
+          # silent source of "invalid reference format".
+          if printf '%s' "$reg" | grep -q '[A-Z]'; then
+            echo "::error::$name contains uppercase characters — docker image references must be lowercase"
+            exit 1
+          fi
+          case "$reg" in
+            *@*)
+              echo "::error::$name must not contain '@'"
+              exit 1 ;;
+          esac
+
+          if [ "$reg" != "$raw" ]; then
+            echo "::warning::$name needed normalising (scheme, trailing slash or whitespace removed) — store it as a bare host:port to avoid this"
+          fi
+          echo "registry resolved from $name (${#reg} characters)"
+
+          echo "NEXUS_DOCKER_REGISTRY=$reg" >> "$GITHUB_ENV"
+
+      - name: Compose BuildKit registry config
+        id: buildkit
+        # setup-buildx-action provisions a `docker-container` driver — BuildKit
+        # runs in its own container with its own registry configuration and does
+        # NOT inherit `insecure-registries` from the host's
+        # /etc/docker/daemon.json. Against a plain-HTTP Nexus connector that
+        # means `docker login` succeeds (daemon) while the push fails (BuildKit).
+        # Always write the file so `config:` below has a valid path; an empty
+        # buildkitd.toml is the no-op default.
+        run: |
+          set -euo pipefail
+          toml="$RUNNER_TEMP/buildkitd.toml"
+          if [ "${{ inputs.insecure-registry }}" = "true" ]; then
+            printf '[registry."%s"]\n  http = true\n' "$NEXUS_DOCKER_REGISTRY" > "$toml"
+            echo "BuildKit will push to $NEXUS_DOCKER_REGISTRY over plain HTTP"
+          else
+            : > "$toml"
+          fi
+          echo "config=$toml" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
-
-      - name: Resolve Nexus registry for context
-        # Pick the dev or prod Docker registry based on the `environment` input.
-        run: |
-          if [ "${{ inputs.environment }}" = "prod" ]; then
-            echo "NEXUS_DOCKER_REGISTRY=${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}" >> "$GITHUB_ENV"
-          else
-            echo "NEXUS_DOCKER_REGISTRY=${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}" >> "$GITHUB_ENV"
-          fi
+        with:
+          buildkitd-config: ${{ steps.buildkit.outputs.config }}
 
       - name: Log in to Nexus Docker registry
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
