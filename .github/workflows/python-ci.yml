@@ -127,6 +127,26 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
+      # The job container runs as root and $GITHUB_WORKSPACE is bind-mounted in
+      # from the host, so everything written above — including the .git/ that
+      # checkout created — ends up owned by uid 0. On a self-hosted runner every
+      # job of the run shares that one directory, so a later job with no
+      # `container:` (docker-build.yml's `docker` job) executes as the
+      # unprivileged runner user and its checkout dies cleaning the tree:
+      # "EACCES: permission denied, unlink '.git/FETCH_HEAD'". Hand ownership
+      # back. $RUNNER_TEMP is created by the runner on the host and bind mounts
+      # preserve numeric ownership, so read the target uid:gid from it rather
+      # than hardcoding the runner account.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi
+
   build:
     needs: test
     runs-on: self-hosted
@@ -226,3 +246,16 @@ jobs:
         env:
           TWINE_USERNAME: ${{ secrets.NEXUS_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      # See the identical step in `test` above: the root-owned workspace this
+      # container leaves behind would break the checkout of the next
+      # non-container job on the same self-hosted runner.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi

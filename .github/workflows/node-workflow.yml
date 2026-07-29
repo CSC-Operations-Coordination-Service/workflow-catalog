@@ -197,6 +197,23 @@ jobs:
           server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
           api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
 
+      # This job container runs as root, so the bind-mounted workspace it leaves
+      # behind (including .git/) is owned by uid 0. On a self-hosted runner the
+      # next job of the run reuses that same directory, and any job without
+      # `container:` runs as the unprivileged runner user — its checkout then
+      # fails with "EACCES: permission denied, unlink '.git/FETCH_HEAD'". Hand
+      # ownership back; $RUNNER_TEMP carries the host uid/gid through the mount.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi
+
   # ---------------------------------------------------------------------------
   # Optional image build — reuses the language-agnostic docker-build.yml.
   # ---------------------------------------------------------------------------
