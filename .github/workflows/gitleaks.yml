@@ -6,8 +6,16 @@ name: Gitleaks secret scan
 # Dual-purpose, on purpose:
 #   * workflow_call  → reusable primitive; other repos call it with `uses:` and
 #                      pass `secrets: inherit` (mirrors the rest of the catalog).
-#   * push / pull_request / workflow_dispatch → guards THIS repo directly, so the
-#                      catalog dogfoods its own scanner (no separate caller needed).
+#   * push / pull_request → guards THIS repo directly, so the catalog dogfoods
+#                      its own scanner (no separate caller needed).
+#
+# Runner: defaults to `ubuntu-latest`, unlike the rest of the catalog. Gitleaks
+#   needs nothing from the internal network — no Nexus, no proxy config, no
+#   internal registry — only the repo checkout and the gitleaks binary, which the
+#   action pulls from GitHub releases. A GitHub-hosted runner guarantees that
+#   egress and keeps the self-hosted pool free for builds that actually need it.
+#   Override with the `runs-on` input if a caller must keep source off hosted
+#   runners.
 #
 # Secrets consumed:
 #   GITLEAKS_LICENSE — REQUIRED by gitleaks-action on *organization* repos
@@ -17,9 +25,8 @@ name: Gitleaks secret scan
 #   GITHUB_TOKEN     — provided automatically by Actions.
 #
 # gitleaks-action reads the triggering event to scope the scan: the pushed commit
-# range on `push`, the PR commits on `pull_request`, and the full history on
-# `workflow_dispatch`. Local pre-commit scanning is available too — see
-# .pre-commit-config.yaml and docs/security-scanning.md.
+# range on `push` and the PR commits on `pull_request`. Local pre-commit scanning
+# is available too — see .pre-commit-config.yaml and docs/security-scanning.md.
 
 on:
   workflow_call:
@@ -28,14 +35,13 @@ on:
         description: "Runner label"
         required: false
         type: string
-        default: "self-hosted"
+        default: "ubuntu-latest"
   push:
   pull_request:
-  workflow_dispatch:
 
 jobs:
   gitleaks:
-    runs-on: ${{ inputs.runs-on || 'self-hosted' }}
+    runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:

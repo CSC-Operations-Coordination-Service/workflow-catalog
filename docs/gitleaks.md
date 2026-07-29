@@ -2,7 +2,7 @@
 
 Requires a license from [gitleaks.io](https://gitleaks.io/). This license must be added as a GitHub secret under the name '`GITLEAKS_LICENSE`' which, if required across multiple repositories, should be an organisation-level secret (see [here](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-an-organization) for details on how to create). Currently on the workflow-catalog repository, a secret has been created at the repository level for testing (creation method can be found [here](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-a-repository)).
 
-Currently, the workflow is set up to run on every pull request, push, and workflow dispatch (see [gitleaks.yml](https://github.com/CSC-Operations-Coordination-Service/workflow-catalog/blob/gitleaks-workflow/.github/workflows/gitleaks.yml))
+Currently, the workflow is set up to run on every pull request and push (see [gitleaks.yml](https://github.com/CSC-Operations-Coordination-Service/workflow-catalog/blob/gitleaks-workflow/.github/workflows/gitleaks.yml))
 
 ## Setting up the pre-commit hook
 

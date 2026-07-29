@@ -29,10 +29,9 @@ the *blocking* CVE gate, Dependency-Track is the *continuous* tracking.
 
 - **`workflow_call`** — a reusable primitive, like the rest of the catalog.
   Other repos consume it with a thin caller (see below).
-- **`push` / `pull_request` / `workflow_dispatch`** — it also self-triggers, so
-  it guards this repo directly. `gitleaks-action` scopes the scan from the
-  event: the pushed commit range on `push`, the PR commits on `pull_request`,
-  and the full history on `workflow_dispatch`.
+- **`push` / `pull_request`** — it also self-triggers, so it guards this repo
+  directly. `gitleaks-action` scopes the scan from the event: the pushed commit
+  range on `push` and the PR commits on `pull_request`.
 
 ### License
 

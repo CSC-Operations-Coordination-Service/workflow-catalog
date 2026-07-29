@@ -46,7 +46,7 @@ composite actions            nexus-context        dependency-track-upload
 | [`python-ci.yml`](../.github/workflows/python-ci.yml) | primitive | Python **test → build → publish** to Nexus. Outputs `version`. |
 | [`sbom.yml`](../.github/workflows/sbom.yml) | primitive | Package **CycloneDX SBOM → Dependency-Track** (consumes the `dist` artifact). |
 | [`docker-build.yml`](../.github/workflows/docker-build.yml) | primitive | Language-agnostic **image build + push** (Nexus / GHCR / Docker Hub) with optional image SBOM → Dependency-Track, optional **Checkov** Dockerfile lint (`scan-dockerfile`), **Grype** CVE gate (`scan-image`), **Dockle** image-hardening lint (`lint-image`), and **Cosign** image signing (`sign-image`, release builds). |
-| [`gitleaks.yml`](../.github/workflows/gitleaks.yml) | primitive | **Secret scanning** with Gitleaks. Dual-triggered: `workflow_call` (reusable) **and** `push`/`pull_request`/`workflow_dispatch` (guards this repo). |
+| [`gitleaks.yml`](../.github/workflows/gitleaks.yml) | primitive | **Secret scanning** with Gitleaks. Dual-triggered: `workflow_call` (reusable) **and** `push`/`pull_request` (guards this repo). |
 | [`node-workflow.yml`](../.github/workflows/node-workflow.yml) | all-in-one | Node/React **install → lint → build → test**, with optional npm SBOM and image build via toggles. |
 
 ### Callers
