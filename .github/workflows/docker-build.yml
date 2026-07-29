@@ -248,6 +248,9 @@ jobs:
         # means `docker login` succeeds (daemon) while the push fails (BuildKit).
         # Always write the file so `config:` below has a valid path; an empty
         # buildkitd.toml is the no-op default.
+        env:
+          PROXY_VAR: ${{ vars.BUILDKIT_HTTP_PROXY }}
+          NO_PROXY_VAR: ${{ vars.BUILDKIT_NO_PROXY }}
         run: |
           set -euo pipefail
           toml="$RUNNER_TEMP/buildkitd.toml"
@@ -259,10 +262,38 @@ jobs:
           fi
           echo "config=$toml" >> "$GITHUB_OUTPUT"
 
+          # BuildKit inherits neither the host daemon's proxy settings nor the
+          # job environment, so resolving `# syntax=` and `FROM` images dials the
+          # internet directly — on a proxy-only network that is a plain i/o
+          # timeout to registry-1.docker.io. Pass the proxy in as driver env.
+          # Prefer the repo/org variable; fall back to an ambient proxy var if
+          # the runner exports one. No proxy configured = unchanged behaviour.
+          proxy="${PROXY_VAR:-${https_proxy:-${http_proxy:-}}}"
+          {
+            echo "driver-opts<<EOF"
+            if [ -n "$proxy" ]; then
+              echo "env.http_proxy=$proxy"
+              echo "env.https_proxy=$proxy"
+              # The Nexus registry itself must bypass the proxy, otherwise the
+              # push is sent to an internet-facing proxy and fails the same way.
+              # Both host and host:port are listed — a no_proxy entry carrying a
+              # port only matches that port.
+              echo "env.no_proxy=${NO_PROXY_VAR:+$NO_PROXY_VAR,}${NEXUS_DOCKER_REGISTRY%%:*},$NEXUS_DOCKER_REGISTRY"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$proxy" ]; then
+            echo "BuildKit egress via proxy (bypassing ${NEXUS_DOCKER_REGISTRY%%:*})"
+          else
+            echo "::warning::No BuildKit proxy configured. If this runner has no direct internet access, resolving '# syntax=' or 'FROM' images will time out — set the BUILDKIT_HTTP_PROXY repository variable."
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
         with:
           buildkitd-config: ${{ steps.buildkit.outputs.config }}
+          driver-opts: ${{ steps.buildkit.outputs.driver-opts }}
 
       - name: Log in to Nexus Docker registry
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
