@@ -107,6 +107,15 @@ fast (no wasted build/login). It needs no secret.
 | `scan-dockerfile` | `false` | Turn the Checkov lint on. |
 | `scan-dockerfile-soft-fail` | `false` | `true` = report findings but don't fail the build. |
 
+Checkov runs in its own `dockerfile-lint` job that the `docker` build job
+depends on — not as a step inside it. `checkov-action` is a *container* action,
+and the runner pulls the image of every container action in a job during **Set
+up job**, before any step-level `if:` is evaluated. As a step it pulled
+`ghcr.io/bridgecrewio/checkov` on every build even with `scan-dockerfile: false`
+— fatal on a runner without ghcr.io egress. A job-level `if` skips the job
+outright, so nothing is pulled when the lint is off. Keep this in mind before
+folding any other container action into the build job.
+
 ```yaml
 jobs:
   docker:
