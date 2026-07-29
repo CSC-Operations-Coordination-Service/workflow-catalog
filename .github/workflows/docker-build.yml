@@ -374,7 +374,22 @@ jobs:
               if [ -n "$MIRROR" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
                 bypass="$bypass,${MIRROR%%:*},$MIRROR"
               fi
-              echo "env.no_proxy=${NO_PROXY_VAR:+$NO_PROXY_VAR,}$bypass"
+              # Quoted deliberately, and the quotes are part of the value handed
+              # to buildx — not shell syntax. buildx CSV-parses every
+              # --driver-opt, so each comma starts what it expects to be another
+              # k=v pair and an unquoted list dies at builder creation with
+              #   ERROR: invalid value "127.0.0.1", expecting k=v
+              # (the second element of BUILDKIT_NO_PROXY). Quoting keeps the list
+              # as one CSV field, and Go's proxy matcher accepts only commas as
+              # its separator, so the commas cannot be avoided. The other opts
+              # above hold no commas and need no quoting.
+              #
+              # Deduplicated on the way out: a mirror on the same host as the
+              # push target repeats that host. Harmless to the matcher, noise in
+              # the log.
+              np=$(printf '%s' "${NO_PROXY_VAR:+$NO_PROXY_VAR,}$bypass" \
+                | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd,)
+              echo "\"env.no_proxy=$np\""
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
