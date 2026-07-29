@@ -1,0 +1,4 @@
+# Keep the image build context small — only dist/ is needed for the
+# artifact-mode build.
+**
+!dist/

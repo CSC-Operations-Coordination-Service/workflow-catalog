@@ -1,0 +1,605 @@
+name: Docker build (reusable)
+
+# Generic, language-agnostic build-and-push workflow.
+# The caller supplies everything project-specific (context, Dockerfile,
+# artifact, build args). Pass secrets with `secrets: inherit`; this workflow
+# reads these repository secrets (dev/prod chosen via the `environment` input):
+#   NEXUS_DOCKER_REGISTRY_DEV / NEXUS_DOCKER_REGISTRY_PROD,
+#   NEXUS_USERNAME, NEXUS_PASSWORD,
+#   NEXUS_PYPI_INDEX_URL_DEV / NEXUS_PYPI_INDEX_URL_PROD (only when mount-pip-index: true),
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
+#   COSIGN_PRIVATE_KEY, COSIGN_PASSWORD (only when sign-image: true, release builds)
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Image repository name (without registry/owner prefix)"
+        required: true
+        type: string
+      context:
+        description: "Docker build context"
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to the Dockerfile"
+        required: true
+        type: string
+      artifact-name:
+        description: "Artifact to download before building (empty = none)"
+        required: false
+        type: string
+        default: ""
+      artifact-path:
+        description: "Where to extract the downloaded artifact"
+        required: false
+        type: string
+        default: "."
+      build-args:
+        description: "Newline-separated build args forwarded to build-push-action"
+        required: false
+        type: string
+        default: ""
+      release:
+        description: "true = semver + latest tags; false = branch + sha tags"
+        required: false
+        type: boolean
+        default: false
+      push-to-ghcr:
+        required: false
+        type: boolean
+        default: false
+      push-to-dockerhub:
+        required: false
+        type: boolean
+        default: false
+      mount-pip-index:
+        description: "Mount the context's Nexus PyPI index as the `pip_index_url` build secret"
+        required: false
+        type: boolean
+        default: false
+      insecure-registry:
+        description: "Nexus serves the Docker connector over plain HTTP — tell BuildKit to push over HTTP instead of TLS"
+        required: false
+        type: boolean
+        default: false
+      registry-mirror:
+        description: >
+          Registry to resolve docker.io images through, as a bare host:port — e.g.
+          a Nexus docker proxy/group connector on a different port than the push
+          target. Lets `FROM` and `# syntax=` images come from Nexus instead of
+          Docker Hub, which is the only route on a runner with no internet egress.
+          Empty = pull from Docker Hub directly.
+        required: false
+        type: string
+        default: ""
+      registry-mirror-port:
+        description: >
+          Connector port on the SAME Nexus host as the push target to use as the
+          docker.io mirror — typically a group repo that includes the Docker Hub
+          proxy (a Nexus proxy repo has no connector of its own, so it is only
+          reachable through a group). The host is taken from the registry secret,
+          so nothing internal is hardcoded in the caller. Ignored when
+          registry-mirror is set explicitly.
+        required: false
+        type: string
+        default: ""
+      buildkit-image:
+        description: >
+          Image the docker-container builder itself runs on, as a full reference —
+          e.g. <nexus-host:port>/moby/buildkit:buildx-stable-1. The runner's docker
+          daemon pulls this while the builder boots, which happens BEFORE
+          buildkitd.toml or the proxy driver-opts below exist, so neither the
+          docker.io mirror nor the proxy applies to it. On a runner whose daemon
+          has no egress this is the pull that hangs the "Set up Docker Buildx"
+          step. Empty = derived from the mirror when one is configured, otherwise
+          Docker Hub's moby/buildkit (needs daemon-level egress). A plain-HTTP
+          source must be in the daemon's own insecure-registries.
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "Target context: 'dev' or 'prod'. Selects which Nexus registry/index secrets are used."
+        required: false
+        type: string
+        default: "dev"
+      generate-sbom:
+        description: "Generate a CycloneDX SBOM from the built image and upload it to Dependency-Track"
+        required: false
+        type: boolean
+        default: false
+      sbom-project-name:
+        description: "Dependency-Track project name for the image SBOM (defaults to '<image-name>-image')"
+        required: false
+        type: string
+        default: ""
+      sbom-project-version:
+        description: "Dependency-Track project version for the image SBOM (usually the release version)"
+        required: false
+        type: string
+        default: ""
+      scan-dockerfile:
+        description: "Lint the Dockerfile for misconfigurations with Checkov before building"
+        required: false
+        type: boolean
+        default: false
+      scan-dockerfile-soft-fail:
+        description: "Report Checkov findings without failing the build (true = warn only)"
+        required: false
+        type: boolean
+        default: false
+      scan-image:
+        description: "Scan the pushed image for vulnerabilities with Grype (fails per scan-severity-cutoff)"
+        required: false
+        type: boolean
+        default: false
+      scan-severity-cutoff:
+        description: "Lowest severity that fails the build: negligible|low|medium|high|critical"
+        required: false
+        type: string
+        default: "high"
+      scan-fail-build:
+        description: "Fail the job when a vulnerability at/above scan-severity-cutoff is found (false = report only)"
+        required: false
+        type: boolean
+        default: true
+      lint-image:
+        description: "Lint the built image against CIS / hardening best practices with Dockle"
+        required: false
+        type: boolean
+        default: false
+      lint-image-failure-threshold:
+        description: "Dockle level that fails the build: INFO|WARN|FATAL"
+        required: false
+        type: string
+        default: "WARN"
+      lint-image-fail-build:
+        description: "Fail the job when Dockle findings reach the threshold (false = report only)"
+        required: false
+        type: boolean
+        default: true
+      sign-image:
+        description: "Sign the pushed image digest with Cosign (key-based). Needs COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Release builds only."
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Dockerfile IaC lint — Checkov checks the Dockerfile for security
+  # misconfigurations (missing USER / HEALTHCHECK, unpinned base image, etc.)
+  # before anything is built or pushed, so a bad Dockerfile fails fast. Set
+  # scan-dockerfile-soft-fail to warn instead of block. Language-agnostic.
+  #
+  # This is a separate job on purpose, not a step in `docker`. checkov-action is
+  # a *container* action (`runs: using: docker`), and the runner pulls the image
+  # of every container action in a job during "Set up job" — before any
+  # step-level `if:` is evaluated. As a step it therefore pulled
+  # ghcr.io/bridgecrewio/checkov on every single build, even with
+  # scan-dockerfile false, which breaks runners that cannot reach ghcr.io. A
+  # job-level `if` skips the job outright, so nothing is pulled.
+  # ---------------------------------------------------------------------------
+  dockerfile-lint:
+    if: inputs.scan-dockerfile
+    runs-on: self-hosted
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Lint Dockerfile (Checkov)
+        uses: bridgecrewio/checkov-action@d9d1e5cdc53e3a91f0c4c58db7bc19ee31cac7e5 # v12.3113.0
+        with:
+          file: ${{ inputs.dockerfile }}
+          framework: dockerfile
+          soft_fail: ${{ inputs.scan-dockerfile-soft-fail }}
+          output_format: cli
+
+  docker:
+    needs: dockerfile-lint
+    # A skipped `needs` job would skip this one too, so spell the gate out:
+    # build unless the lint actually failed. Keeps the fail-fast behaviour
+    # (no build/login when the Dockerfile is bad) while letting the common
+    # scan-dockerfile: false path through.
+    if: ${{ !cancelled() && needs.dockerfile-lint.result != 'failure' }}
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write # required to push to GHCR
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download artifact
+        if: inputs.artifact-name != ''
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-path }}
+
+      # Resolved before Buildx is provisioned, because the BuildKit config below
+      # needs the registry host.
+      - name: Resolve Nexus registry for context
+        # Pick the dev or prod Docker registry based on the `environment` input,
+        # then normalise and validate it. A registry secret carrying a scheme
+        # ("https://host:8082"), a trailing slash, or stray whitespace produces a
+        # tag like "https://host:8082/app:develop", which buildx rejects with a
+        # bare "invalid reference format". GitHub masks the value, so the log
+        # shows only "***/app:develop" and the cause is invisible. Normalise the
+        # usual copy-paste damage and fail here, naming the offending secret,
+        # instead of several steps later on an unreadable error.
+        env:
+          RAW_DEV: ${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}
+          RAW_PROD: ${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            raw=$RAW_PROD
+            name=NEXUS_DOCKER_REGISTRY_PROD
+          else
+            raw=$RAW_DEV
+            name=NEXUS_DOCKER_REGISTRY_DEV
+          fi
+
+          if [ -z "$raw" ]; then
+            echo "::error::$name is empty or unset. Set it to a bare host:port — no scheme, no path — e.g. nexus.example.local:8082"
+            exit 1
+          fi
+
+          reg=$(printf '%s' "$raw" | tr -d '[:space:]')
+          reg=${reg#http://}
+          reg=${reg#https://}
+          while [ "${reg%/}" != "$reg" ]; do reg=${reg%/}; done
+
+          # Image references must be lowercase; an uppercase host is another
+          # silent source of "invalid reference format".
+          if printf '%s' "$reg" | grep -q '[A-Z]'; then
+            echo "::error::$name contains uppercase characters — docker image references must be lowercase"
+            exit 1
+          fi
+          case "$reg" in
+            *@*)
+              echo "::error::$name must not contain '@'"
+              exit 1 ;;
+          esac
+
+          if [ "$reg" != "$raw" ]; then
+            echo "::warning::$name needed normalising (scheme, trailing slash or whitespace removed) — store it as a bare host:port to avoid this"
+          fi
+          echo "registry resolved from $name (${#reg} characters)"
+
+          echo "NEXUS_DOCKER_REGISTRY=$reg" >> "$GITHUB_ENV"
+
+      - name: Compose BuildKit registry config
+        id: buildkit
+        # setup-buildx-action provisions a `docker-container` driver — BuildKit
+        # runs in its own container with its own registry configuration and does
+        # NOT inherit `insecure-registries` from the host's
+        # /etc/docker/daemon.json. Against a plain-HTTP Nexus connector that
+        # means `docker login` succeeds (daemon) while the push fails (BuildKit).
+        # Always write the file so `config:` below has a valid path; an empty
+        # buildkitd.toml is the no-op default.
+        env:
+          PROXY_VAR: ${{ vars.BUILDKIT_HTTP_PROXY }}
+          NO_PROXY_VAR: ${{ vars.BUILDKIT_NO_PROXY }}
+          MIRROR_INPUT: ${{ inputs.registry-mirror }}
+          MIRROR_PORT: ${{ inputs.registry-mirror-port }}
+          INSECURE: ${{ inputs.insecure-registry }}
+          BUILDKIT_IMAGE: ${{ inputs.buildkit-image }}
+        run: |
+          set -euo pipefail
+          toml="$RUNNER_TEMP/buildkitd.toml"
+          : > "$toml"
+
+          # An explicit host:port wins; otherwise pair the given connector port
+          # with the host from the registry secret.
+          if [ -n "$MIRROR_INPUT" ]; then
+            MIRROR=$MIRROR_INPUT
+          elif [ -n "$MIRROR_PORT" ]; then
+            MIRROR="${NEXUS_DOCKER_REGISTRY%%:*}:$MIRROR_PORT"
+          else
+            MIRROR=""
+          fi
+
+          # Registries BuildKit must talk to over plain HTTP rather than TLS.
+          http_regs=""
+          if [ "$INSECURE" = "true" ]; then
+            http_regs="$NEXUS_DOCKER_REGISTRY"
+            echo "BuildKit will push to $NEXUS_DOCKER_REGISTRY over plain HTTP"
+          fi
+
+          # Resolve docker.io through the mirror, so `FROM python:3.11-slim` and
+          # the `# syntax=` frontend are fetched from Nexus. This is what makes a
+          # build work with no internet egress at all, rather than routing Docker
+          # Hub traffic through a proxy.
+          if [ -n "$MIRROR" ]; then
+            printf '[registry."docker.io"]\n  mirrors = ["%s"]\n' "$MIRROR" >> "$toml"
+            echo "BuildKit will resolve docker.io images via $MIRROR"
+            if [ "$INSECURE" = "true" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
+              http_regs="$http_regs $MIRROR"
+            fi
+          fi
+
+          for r in $http_regs; do
+            printf '[registry."%s"]\n  http = true\n' "$r" >> "$toml"
+          done
+
+          echo "config=$toml" >> "$GITHUB_OUTPUT"
+          echo "mirror=$MIRROR" >> "$GITHUB_OUTPUT"
+          # A mirror on its own connector needs its own docker login (see below).
+          if [ -n "$MIRROR" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
+            echo "mirror-login=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mirror-login=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # BuildKit inherits neither the host daemon's proxy settings nor the
+          # job environment, so resolving `# syntax=` and `FROM` images dials the
+          # internet directly — on a proxy-only network that is a plain i/o
+          # timeout to registry-1.docker.io. Pass the proxy in as driver env.
+          # Prefer the repo/org variable; fall back to an ambient proxy var if
+          # the runner exports one. No proxy configured = unchanged behaviour.
+          proxy="${PROXY_VAR:-${https_proxy:-${http_proxy:-}}}"
+
+          # The builder runs *on* an image, and the runner's docker daemon pulls
+          # that image before buildkitd.toml or the env driver-opts below take
+          # effect — so a daemon with no egress hangs in "Set up Docker Buildx"
+          # no matter how well BuildKit itself is configured. Serve it from Nexus
+          # whenever we know a Docker Hub proxy path there.
+          if [ -n "$BUILDKIT_IMAGE" ]; then
+            IMAGE=$BUILDKIT_IMAGE
+          elif [ -n "$MIRROR" ]; then
+            IMAGE="$MIRROR/moby/buildkit:buildx-stable-1"
+          else
+            IMAGE=""
+          fi
+
+          {
+            echo "driver-opts<<EOF"
+            if [ -n "$IMAGE" ]; then
+              echo "image=$IMAGE"
+            fi
+            if [ -n "$proxy" ]; then
+              echo "env.http_proxy=$proxy"
+              echo "env.https_proxy=$proxy"
+              # The Nexus registry and the mirror must bypass the proxy, otherwise
+              # their traffic is sent to an internet-facing proxy and fails the
+              # same way. Both host and host:port are listed — a no_proxy entry
+              # carrying a port only matches that port.
+              bypass="${NEXUS_DOCKER_REGISTRY%%:*},$NEXUS_DOCKER_REGISTRY"
+              if [ -n "$MIRROR" ] && [ "$MIRROR" != "$NEXUS_DOCKER_REGISTRY" ]; then
+                bypass="$bypass,${MIRROR%%:*},$MIRROR"
+              fi
+              # Quoted deliberately, and the quotes are part of the value handed
+              # to buildx — not shell syntax. buildx CSV-parses every
+              # --driver-opt, so each comma starts what it expects to be another
+              # k=v pair and an unquoted list dies at builder creation with
+              #   ERROR: invalid value "127.0.0.1", expecting k=v
+              # (the second element of BUILDKIT_NO_PROXY). Quoting keeps the list
+              # as one CSV field, and Go's proxy matcher accepts only commas as
+              # its separator, so the commas cannot be avoided. The other opts
+              # above hold no commas and need no quoting.
+              #
+              # Deduplicated on the way out: a mirror on the same host as the
+              # push target repeats that host. Harmless to the matcher, noise in
+              # the log.
+              np=$(printf '%s' "${NO_PROXY_VAR:+$NO_PROXY_VAR,}$bypass" \
+                | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd,)
+              echo "\"env.no_proxy=$np\""
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$IMAGE" ]; then
+            echo "Builder image: $IMAGE (pulled by the runner's docker daemon)"
+          else
+            echo "::warning::The builder image will be pulled from Docker Hub by the runner's docker daemon. If 'Set up Docker Buildx' hangs or times out at 'Booting builder', that daemon has no egress to registry-1.docker.io — set buildkit-image to a Nexus path such as <host:port>/moby/buildkit:buildx-stable-1."
+          fi
+
+          if [ -n "$proxy" ]; then
+            echo "BuildKit egress via proxy (bypassing ${NEXUS_DOCKER_REGISTRY%%:*})"
+          elif [ -z "$MIRROR" ]; then
+            echo "::warning::BuildKit has neither a proxy nor a docker.io mirror. On a runner without direct internet egress, resolving '# syntax=' or 'FROM' images will time out — set registry-mirror-port to a Nexus group connector that includes the Docker Hub proxy, or the BUILDKIT_HTTP_PROXY repository variable."
+          fi
+
+      - name: Set up Docker Buildx
+        # Bounded so an unreachable source for the builder image fails in minutes
+        # with the warning above in the log, instead of sitting on the daemon's
+        # pull until the job timeout.
+        timeout-minutes: 8
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+        with:
+          buildkitd-config: ${{ steps.buildkit.outputs.config }}
+          driver-opts: ${{ steps.buildkit.outputs.driver-opts }}
+
+      - name: Log in to Nexus Docker registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.NEXUS_DOCKER_REGISTRY }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      # BuildKit reads registry credentials from the client's docker config, so a
+      # mirror on a different connector than the push target needs its own login —
+      # a Nexus group answers /v2/ with 401 for anonymous pulls, which would fail
+      # the `FROM` resolution just as an unreachable Docker Hub does.
+      - name: Log in to Nexus mirror registry
+        if: steps.buildkit.outputs.mirror-login == 'true'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ steps.buildkit.outputs.mirror }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.push-to-ghcr
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: inputs.push-to-dockerhub
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose image list
+        id: images
+        run: |
+          {
+            echo "list<<EOF"
+            echo "${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}"
+            if [ "${{ inputs.push-to-ghcr }}" = "true" ]; then
+              echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
+            fi
+            if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
+              echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata (dev)
+        id: meta_dev
+        if: ${{ !inputs.release }}
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ steps.images.outputs.list }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+
+      - name: Docker metadata (release)
+        id: meta_release
+        if: ${{ inputs.release }}
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ steps.images.outputs.list }}
+          flavor: |
+            latest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: ${{ inputs.build-args }}
+          secrets: ${{ inputs.mount-pip-index && format('pip_index_url={0}', inputs.environment == 'prod' && secrets.NEXUS_PYPI_INDEX_URL_PROD || secrets.NEXUS_PYPI_INDEX_URL_DEV) || '' }}
+          tags: ${{ steps.meta_dev.outputs.tags || steps.meta_release.outputs.tags }}
+          labels: ${{ steps.meta_dev.outputs.labels || steps.meta_release.outputs.labels }}
+
+      # -----------------------------------------------------------------------
+      # SBOM — generate a CycloneDX inventory of the pushed image (OS packages +
+      # interpreter + installed wheels) and publish it to Dependency-Track.
+      # Syft pulls the image by digest from the Nexus registry (already logged in
+      # above). Language-agnostic: any caller passing generate-sbom gets this.
+      # -----------------------------------------------------------------------
+      - name: Generate image SBOM (CycloneDX)
+        if: inputs.generate-sbom
+        uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb # v0.17.7
+        with:
+          image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom-image.cdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM artifact
+        if: inputs.generate-sbom
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ inputs.image-name }}-image
+          path: sbom-image.cdx.json
+          if-no-files-found: error
+
+      - name: Upload image SBOM to Dependency-Track
+        if: inputs.generate-sbom
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
+        with:
+          bom-file: sbom-image.cdx.json
+          project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || format('{0}-image', inputs.image-name) }}
+          project-version: ${{ inputs.sbom-project-version }}
+          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+
+      # -----------------------------------------------------------------------
+      # Vulnerability scan — Grype scans the pushed image against its CVE DB and
+      # fails the build when something at or above `scan-severity-cutoff` is
+      # found. Grype pulls the image by digest from the Nexus registry (already
+      # logged in above) and catalogs it itself, so this is independent of the
+      # SBOM feature above. Runs after the SBOM upload so the inventory is
+      # recorded even when the gate trips. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Scan image for vulnerabilities (Grype)
+        id: scan
+        if: inputs.scan-image
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          fail-build: ${{ inputs.scan-fail-build }}
+          severity-cutoff: ${{ inputs.scan-severity-cutoff }}
+          output-format: sarif
+
+      - name: Upload Grype scan report (SARIF)
+        # Runs whether the scan passed or tripped the gate, so the report is
+        # always kept; skipped only when scanning is off or the job is cancelled.
+        if: ${{ !cancelled() && inputs.scan-image }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grype-${{ inputs.image-name }}-scan
+          path: ${{ steps.scan.outputs.sarif }}
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Image hardening lint — Dockle checks the pushed image against the CIS
+      # Docker Benchmark and best practices (non-root, no setuid/setgid, no
+      # secrets/credentials baked into layers, cleared package caches, ...).
+      # Complements Checkov (Dockerfile source) and Grype (CVEs) by inspecting
+      # the actual image layers. Runs natively on the runner and pulls by digest
+      # through the docker socket, reusing the Nexus login above. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Lint image hardening (Dockle)
+        id: lint
+        if: inputs.lint-image
+        uses: erzz/dockle-action@e8a7c41f36f1236ca3282b298d425ffbfdb2e922 # v1.4.1
+        with:
+          image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          report-format: sarif
+          report-name: dockle-report
+          failure-threshold: ${{ inputs.lint-image-failure-threshold }}
+          exit-code: ${{ inputs.lint-image-fail-build && '1' || '0' }}
+
+      - name: Upload Dockle report (SARIF)
+        if: ${{ !cancelled() && inputs.lint-image }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dockle-${{ inputs.image-name }}-report
+          path: dockle-report.sarif
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Image signing — Cosign (key-based) signs every pushed reference by
+      # digest, so consumers (or a Kubernetes admission controller) can verify
+      # the image was built by this CI and has not been tampered with:
+      #   cosign verify --key cosign.pub <registry>/<image>@<digest>
+      # Gated to release builds; reuses the registry logins established above.
+      # Needs the COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Language-agnostic.
+      # -----------------------------------------------------------------------
+      - name: Sign image (Cosign)
+        if: ${{ inputs.sign-image && inputs.release }}
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/cosign-sign@develop
+        with:
+          images: ${{ steps.images.outputs.list }}
+          digest: ${{ steps.build.outputs.digest }}
+          private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          password: ${{ secrets.COSIGN_PASSWORD }}

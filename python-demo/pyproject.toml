@@ -1,0 +1,14 @@
+[build-system]
+# AVOID CHANGING REQUIRES: IT WILL BE UPDATED BY PYSCAFFOLD!
+requires = ["setuptools>=46.1.0", "setuptools_scm[toml]>=5"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# For smarter version schemes and other configuration options,
+# check out https://github.com/pypa/setuptools_scm
+version_scheme = "no-guess-dev"
+# This package lives in a subdirectory of the repository, so there is no .git in
+# python-demo/ itself. setuptools_scm v8 stopped walking up to a parent
+# repository by default, so without this every build that is not handed a
+# SETUPTOOLS_SCM_PRETEND_VERSION fails with "unable to detect version".
+search_parent_directories = true

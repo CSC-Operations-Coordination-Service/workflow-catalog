@@ -1,0 +1,114 @@
+name: Package SBOM (reusable)
+
+# Generate a CycloneDX SBOM for a built Python distribution and upload it to
+# Dependency-Track. Consumes the `dist` artifact produced by python-ci.yml,
+# installs the wheel into an isolated env, and inventories it with cyclonedx-py.
+#
+# Pass secrets with `secrets: inherit`. Consumes these repository secrets:
+#   DEPENDENCYTRACK_URL, DEPENDENCYTRACK_API_KEY
+#
+# The image SBOM is produced separately inside docker-build.yml.
+
+on:
+  workflow_call:
+    inputs:
+      project-dir:
+        description: "Directory containing the package (tox.ini with a `sbom` env, ci/)"
+        required: false
+        type: string
+        default: "python-demo"
+      project-name:
+        description: "Dependency-Track project name (kept stable across releases)"
+        required: true
+        type: string
+      project-version:
+        description: "Dependency-Track project version (usually the release version)"
+        required: true
+        type: string
+      python-version:
+        description: "Python version for the SBOM container"
+        required: false
+        type: string
+        default: "3.11"
+      artifact-name:
+        description: "Name of the distribution artifact to download"
+        required: false
+        type: string
+        default: "dist"
+      context:
+        description: "Nexus context used to resolve any dependencies: 'dev' or 'prod'"
+        required: false
+        type: string
+        default: "prod"
+
+jobs:
+  sbom:
+    runs-on: self-hosted
+    container:
+      image: python:${{ inputs.python-version }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Nexus context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
+        with:
+          context: ${{ inputs.context }}
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Download dist artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.project-dir }}/dist/
+
+      - name: Install package into an isolated env
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          python -m venv .sbom-venv
+          .sbom-venv/bin/pip install dist/*.whl
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Generate CycloneDX SBOM
+        run: tox -e sbom -- .sbom-venv
+        working-directory: ${{ inputs.project-dir }}
+
+      - name: Upload package SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ inputs.project-name }}-package
+          path: ${{ inputs.project-dir }}/sbom-python.cdx.json
+          if-no-files-found: error
+
+      - name: Upload package SBOM to Dependency-Track
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
+        with:
+          bom-file: ${{ inputs.project-dir }}/sbom-python.cdx.json
+          project-name: ${{ inputs.project-name }}
+          project-version: ${{ inputs.project-version }}
+          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+
+      # This job container runs as root, so the bind-mounted workspace it leaves
+      # behind (including .git/) is owned by uid 0. On a self-hosted runner the
+      # next job of the run reuses that same directory, and any job without
+      # `container:` runs as the unprivileged runner user — its checkout then
+      # fails with "EACCES: permission denied, unlink '.git/FETCH_HEAD'". Hand
+      # ownership back; $RUNNER_TEMP carries the host uid/gid through the mount.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi

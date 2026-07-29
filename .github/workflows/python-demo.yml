@@ -1,0 +1,108 @@
+name: python-demo CI/CD
+
+# Thin caller for the python-demo project. Wires triggers to the reusable
+# building blocks in this catalog:
+#   .github/workflows/python-ci.yml     — test + build + publish
+#   .github/workflows/sbom.yml          — package SBOM -> Dependency-Track
+#   .github/workflows/docker-build.yml  — image build/push (+ image SBOM)
+#
+# Triggers:
+#   push to develop        -> ci + docker image (Nexus, from the built artifact)
+#   push tag x.y.z         -> ci + package SBOM + release image (Nexus/GHCR/DockerHub) + image SBOM
+#   workflow_dispatch      -> manual run (build the develop image on demand)
+
+on:
+  push:
+    branches:
+      - "develop"
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+" # release tags (x.y.z)
+  workflow_dispatch: # manual trigger (e.g. build the develop Docker image on demand)
+
+# Cancel superseded runs on the same ref (a newer push/tag makes older runs moot).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Test, build the wheel/sdist, publish to Nexus. Exposes `version`.
+  ci:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/python-ci.yml
+    with:
+      project-dir: python-demo
+    secrets: inherit
+
+  # Release only: package SBOM -> Dependency-Track project "python-demo".
+  sbom:
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/sbom.yml
+    with:
+      project-dir: python-demo
+      project-name: python-demo
+      project-version: ${{ needs.ci.outputs.version }}
+    secrets: inherit
+
+  # develop / manual: build the image from the freshly built artifact (Mode 1).
+  docker-local:
+    needs: ci
+    if: github.ref == 'refs/heads/develop'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image-name: python-demo
+      context: python-demo
+      dockerfile: python-demo/Dockerfile.local
+      artifact-name: dist
+      artifact-path: python-demo/dist/
+      environment: dev
+      # The dev Docker connector is plain HTTP: an https probe against it fails
+      # with a TLS "packet length too long", and it is listed in the runner's
+      # daemon insecure-registries.
+      insecure-registry: true
+      # docker.io is reached through BUILDKIT_HTTP_PROXY rather than a Nexus
+      # mirror. Using the mirror instead would need registry-mirror-port set to
+      # whichever group includes the Docker Hub proxy — that port is not yet
+      # confirmed, and a wrong one breaks `FROM`.
+      #
+      # NOT covered by either of the above: the *builder's own* image, which the
+      # runner's docker daemon pulls from Docker Hub before BuildKit exists. If
+      # "Set up Docker Buildx" stalls at "Booting builder", set
+      #   buildkit-image: <nexus-host:port>/moby/buildkit:buildx-stable-1
+      # (or registry-mirror-port, which derives it). See
+      # docs/docker-build-network.md for the three hops and their knobs.
+    secrets: inherit
+
+  # Release only: build the image from the Nexus package (Mode 2) and push to
+  # Nexus + GHCR + Docker Hub, generate + upload the image SBOM, and sign the
+  # pushed image with Cosign (needs COSIGN_PRIVATE_KEY / COSIGN_PASSWORD).
+  docker-registry:
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image-name: python-demo
+      context: python-demo
+      dockerfile: python-demo/Dockerfile.registry
+      build-args: |
+        PACKAGE_VERSION=${{ needs.ci.outputs.version }}
+      release: true
+      push-to-ghcr: true
+      push-to-dockerhub: true
+      mount-pip-index: true
+      environment: prod
+      # Left at the defaults: whether the *prod* connector is plain HTTP has not
+      # been verified. If a release build fails at the push with a TLS error, set
+      # insecure-registry: true here as well.
+      generate-sbom: true
+      sbom-project-name: python-demo-image
+      sbom-project-version: ${{ needs.ci.outputs.version }}
+      sign-image: true
+    secrets: inherit

@@ -1,0 +1,321 @@
+name: Python CI (reusable)
+
+# Reusable test + build + publish pipeline for a Nexus-backed Python package.
+#
+# Flow: test (pytest) -> build (wheel/sdist, publish to Nexus), with sonarqube
+# (SonarQube scan of the reports `test` produced) running alongside `build`.
+# The Nexus context is chosen automatically: release tags (refs/tags/*) use the
+# 'prod' repos, everything else uses 'dev'.
+#
+# Pass secrets with `secrets: inherit`. Consumes these repository secrets:
+#   NEXUS_HOST, NEXUS_PORT           (rendered into ~/pip.conf and ~/.pypirc)
+#   NEXUS_USERNAME, NEXUS_PASSWORD   (pip reads via ~/.netrc + twine publish)
+#   SONAR_TOKEN, SONAR_HOST_URL      (SonarQube scan)
+#
+# Outputs:
+#   version — the setuptools_scm version resolved for this ref.
+
+on:
+  workflow_call:
+    inputs:
+      project-dir:
+        description: "Directory containing the package (tox.ini, setup.cfg, ci/)"
+        required: false
+        type: string
+        default: "python-demo"
+      python-version:
+        description: "Python version for the build/test containers"
+        required: false
+        type: string
+        default: "3.11"
+      publish:
+        description: "Publish the built distribution to Nexus PyPI"
+        required: false
+        type: boolean
+        default: true
+      pretend-version:
+        description: "setuptools_scm fallback version for the test job (no git history there)"
+        required: false
+        type: string
+        default: "0.0.0"
+    outputs:
+      version:
+        description: "Resolved package version (setuptools_scm)"
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  test:
+    runs-on: self-hosted
+    container:
+      image: python:${{ inputs.python-version }}
+      options: --add-host=host.docker.internal:host-gateway
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Nexus context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
+        with:
+          context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Install tox
+        run: pip install tox
+
+      - name: Run tests
+        run: tox
+        working-directory: ${{ inputs.project-dir }}
+        env:
+          # Unsuffixed on purpose. The *_FOR_<DIST> form is matched against the
+          # dist name, so it silently stops applying for any caller whose
+          # project-dir is not python-demo, and it is ignored outright wherever
+          # the dist name is unknown (e.g. the `python -m setuptools_scm` CLI,
+          # which does not read `name` from setup.cfg).
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.pretend-version }}
+
+      # Hand the reports to the `sonarqube` job. tox writes them into the project
+      # dir, which is where sonar-project.properties expects them
+      # (sonar.python.coverage.reportPaths / sonar.python.xunit.reportPaths), so
+      # the download in that job restores the same relative layout.
+      - name: Upload test reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-reports
+          path: |
+            ${{ inputs.project-dir }}/coverage.xml
+            ${{ inputs.project-dir }}/pytest-report.xml
+          if-no-files-found: error
+        env:
+          ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "2"
+
+      # The job container runs as root and $GITHUB_WORKSPACE is bind-mounted in
+      # from the host, so everything written above — including the .git/ that
+      # checkout created — ends up owned by uid 0. On a self-hosted runner every
+      # job of the run shares that one directory, so a later job with no
+      # `container:` (docker-build.yml's `docker` job) executes as the
+      # unprivileged runner user and its checkout dies cleaning the tree:
+      # "EACCES: permission denied, unlink '.git/FETCH_HEAD'". Hand ownership
+      # back. $RUNNER_TEMP is created by the runner on the host and bind mounts
+      # preserve numeric ownership, so read the target uid:gid from it rather
+      # than hardcoding the runner account.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi
+
+  # Static analysis, split out of `test` so a scanner or SonarQube-server problem
+  # is distinguishable at a glance from a genuine test failure. Runs in parallel
+  # with `build` — nothing downstream consumes its result, but a failure here
+  # still fails the workflow.
+  #
+  # Kept in the same container image and with the same --add-host as `test`: if
+  # SONAR_HOST_URL points at host.docker.internal, that alias exists only inside
+  # the container and the scan would not resolve it from the host runner.
+  sonarqube:
+    needs: test
+    runs-on: self-hosted
+    container:
+      image: python:${{ inputs.python-version }}
+      options: --add-host=host.docker.internal:host-gateway
+
+    steps:
+      # Preflight the SonarQube credentials before doing any work: the scan
+      # action only *warns* when SONAR_TOKEN is empty, so a missing or stale
+      # secret otherwise surfaces much later as a bare HTTP 401 from the
+      # scanner bootstrap ("Failed to query server version").
+      - name: Check SonarQube URL and token
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ -n "$SONAR_HOST_URL" ] || fail "SONAR_HOST_URL is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list."
+          [ -n "$SONAR_TOKEN" ] || fail "SONAR_TOKEN is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list."
+
+          case "$SONAR_HOST_URL" in
+            http://*|https://*) ;;
+            *) fail "SONAR_HOST_URL must start with http:// or https://" ;;
+          esac
+          case "$SONAR_HOST_URL" in
+            */) fail "SONAR_HOST_URL must not end with a slash — the scanner appends /api/... to it." ;;
+          esac
+
+          # Safe to print: a length and a truncated hash reveal nothing usable,
+          # but let you compare against the token you meant to store:
+          #   printf '%s' "$SONAR_TOKEN" | sha256sum | cut -c1-12
+          # A SonarQube token is 44 chars (sqa_/sqp_/squ_ + 40); more means
+          # stray whitespace crept into the secret.
+          echo "SONAR_TOKEN length: ${#SONAR_TOKEN}, sha256: $(printf '%s' "$SONAR_TOKEN" | sha256sum | cut -c1-12)"
+
+          # Identifies which SonarQube answered, without echoing the URL secret.
+          echo "server: $(curl -sS -m 20 "$SONAR_HOST_URL/api/system/status" || echo unreachable)"
+
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            -H "Authorization: Bearer $SONAR_TOKEN" \
+            "$SONAR_HOST_URL/api/v2/analysis/version" || true)
+
+          case "${code:-000}" in
+            200) echo "SonarQube reachable, token accepted." ;;
+            401|403) fail "SonarQube rejected the token (HTTP $code). It is expired, revoked, or left over from a previous server — regenerate it and update the secret." ;;
+            000) fail "Cannot reach $SONAR_HOST_URL from the runner (DNS, routing or proxy)." ;;
+            *) fail "Unexpected HTTP $code from SonarQube — expected 200." ;;
+          esac
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # sonar.scm.provider=git needs history to attribute lines; a shallow
+          # clone leaves blame data empty and new-code detection unreliable.
+          fetch-depth: 0
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download test reports
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: test-reports
+          path: ${{ inputs.project-dir }}
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # See the identical step in `test`: this container runs as root, and the
+      # root-owned workspace it would leave behind breaks the checkout of the next
+      # non-container job on the same self-hosted runner.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi
+
+  build:
+    needs: test
+    runs-on: self-hosted
+    container:
+      image: python:${{ inputs.python-version }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # full history + tags so setuptools_scm computes the real version
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up Nexus context
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
+        with:
+          context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Install tox
+        run: pip install tox setuptools_scm
+
+      # setuptools_scm derives the version from git metadata, so an unusable work
+      # tree otherwise surfaces as a bare "unable to detect version" LookupError
+      # out of a PEP 517 backend two steps later. Check it where the cause is
+      # still visible.
+      - name: Check git metadata for setuptools_scm
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          command -v git >/dev/null 2>&1 || fail "git is missing from the python:${{ inputs.python-version }} container. actions/checkout then falls back to a REST API tarball, which carries no .git, and setuptools_scm cannot resolve a version from it."
+
+          git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$PWD is not part of a usable git work tree: $(git status 2>&1 | tr '\n' ' ')"
+
+          # Note: the toplevel is the repository root, not this directory —
+          # python-demo/ has no .git of its own, which is why the package sets
+          # search_parent_directories in [tool.setuptools_scm].
+          echo "toplevel: $(git rev-parse --show-toplevel)"
+          echo "HEAD:     $(git rev-parse --short HEAD)"
+          echo "tags:     $(git tag --list | wc -l)"
+          echo "describe: $(git describe --tags --always --dirty 2>&1)"
+
+      - name: Resolve version
+        id: version
+        working-directory: ${{ inputs.project-dir }}
+        run: |
+          set -euo pipefail
+
+          # Deliberately not `echo "version=$(python -m setuptools_scm)"`: the
+          # exit status of a command substitution inside echo is discarded, so
+          # that form kept this step green when setuptools_scm failed and
+          # exported an empty version — breaking the build step below and every
+          # consumer of the `version` output.
+          version=$(python -m setuptools_scm)
+          [ -n "$version" ] || { echo "::error::setuptools_scm resolved an empty version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
+
+      - name: Build distribution
+        run: tox -e build
+        working-directory: ${{ inputs.project-dir }}
+        env:
+          # The PEP 517 backend runs in build's own isolated venv; hand it the
+          # version resolved above rather than making it re-derive one, so the
+          # artifact version and the `version` output cannot diverge.
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: ${{ inputs.project-dir }}/dist/
+          if-no-files-found: error
+        env:
+          # A dist is two small files, so parallel block uploads buy nothing
+          # here, while every extra simultaneous TLS connection to Azure is
+          # another chance for a corporate firewall to reset the batch.
+          # This knob requires @actions/artifact >= 2.2.1, i.e. upload-artifact
+          # >= v4.6.0 — it is silently ignored on older pins, so it must be
+          # kept in step with the SHA above.
+          ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "2"
+
+      - name: Publish to Nexus
+        if: inputs.publish
+        # tox publishes to the server named in TWINE_REPOSITORY (set by
+        # nexus-context to nexus-dev / nexus-prod), resolved against ~/.pypirc.
+        # Credentials come from the env vars below, not the committed file.
+        run: tox -e publish
+        working-directory: ${{ inputs.project-dir }}
+        env:
+          TWINE_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      # See the identical step in `test` above: the root-owned workspace this
+      # container leaves behind would break the checkout of the next
+      # non-container job on the same self-hosted runner.
+      - name: Return workspace ownership to the runner user
+        if: always()
+        run: |
+          owner=$(stat -c '%u:%g' "$RUNNER_TEMP")
+          if chown -R "$owner" "$GITHUB_WORKSPACE"; then
+            echo "workspace handed back to uid:gid $owner"
+          else
+            echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
+          fi
