@@ -246,7 +246,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: ${{ inputs.image-name }}
       context: ${{ inputs.docker-context }}

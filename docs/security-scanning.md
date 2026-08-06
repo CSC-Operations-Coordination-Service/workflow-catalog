@@ -135,7 +135,7 @@ case.
 ```yaml
 jobs:
   docker:
-    uses: ./.github/workflows/docker-build.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: my-app
       dockerfile: Dockerfile
@@ -207,7 +207,7 @@ see [Using the scanners as plain steps](#using-the-scanners-as-plain-steps).
 ```yaml
 jobs:
   docker:
-    uses: ./.github/workflows/docker-build.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: my-app
       dockerfile: Dockerfile
@@ -260,7 +260,7 @@ The Dockle result is always attached to the run as a SARIF artifact
 ```yaml
 jobs:
   docker:
-    uses: ./.github/workflows/docker-build.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: my-app
       dockerfile: Dockerfile
@@ -307,7 +307,7 @@ publish `cosign.pub` so verifiers can check signatures.
 ```yaml
 jobs:
   docker:
-    uses: ./.github/workflows/docker-build.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: my-app
       dockerfile: Dockerfile

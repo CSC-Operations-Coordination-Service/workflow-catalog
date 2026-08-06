@@ -77,13 +77,13 @@ registry-from-Nexus on tags).
 ```yaml
 jobs:
   ci:
-    uses: ./.github/workflows/python-ci.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/python-ci.yml@develop
     with: { project-dir: python-demo }
     secrets: inherit
   sbom:
     needs: ci
     if: startsWith(github.ref, 'refs/tags/')
-    uses: ./.github/workflows/sbom.yml
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/sbom.yml@develop
     with: { project-name: python-demo, project-version: ${{ needs.ci.outputs.version }} }
     secrets: inherit
   # ...docker-local / docker-registry call docker-build.yml
