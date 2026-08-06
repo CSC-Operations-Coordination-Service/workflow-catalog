@@ -60,6 +60,14 @@ jobs:
       artifact-name: dist
       artifact-path: python-demo/dist/
       environment: dev
+      # Checkov lints Dockerfile.local before anything is built. Report-only:
+      # both demo Dockerfiles pass every check except CKV_DOCKER_2 (no
+      # HEALTHCHECK), and python-demo is a one-shot CLI — `python-demo 10` runs
+      # and exits, so there is no long-lived process for a healthcheck to poll.
+      # Blocking on it would skip the `docker` job and stop the develop build,
+      # so the finding is reported and the build continues.
+      scan-dockerfile: true
+      scan-dockerfile-soft-fail: true
       # The dev Docker connector is plain HTTP: an https probe against it fails
       # with a TLS "packet length too long", and it is listed in the runner's
       # daemon insecure-registries.
@@ -98,6 +106,10 @@ jobs:
       push-to-dockerhub: true
       mount-pip-index: true
       environment: prod
+      # Same report-only lint as docker-local, on Dockerfile.registry — see the
+      # note there. A release must not be blocked by CKV_DOCKER_2 either.
+      scan-dockerfile: true
+      scan-dockerfile-soft-fail: true
       # Left at the defaults: whether the *prod* connector is plain HTTP has not
       # been verified. If a release build fails at the push with a TLS error, set
       # insecure-registry: true here as well.

@@ -1,0 +1,147 @@
+name: "Grype vulnerability scan"
+description: >
+  Scan a container image, a directory or an existing SBOM for known
+  vulnerabilities with Grype, and fail the step when a finding reaches
+  `severity-cutoff`. Exactly one source must be given.
+
+  For an `image`, Grype pulls the reference and catalogs it itself, so the
+  runner must already be logged in to that registry; pass the image **by
+  digest** so the gate applies to the exact image that was built. Scanning an
+  `sbom` produced earlier by the syft-sbom action skips the second pull and
+  guarantees the scan and the published inventory describe the same artifact —
+  at the cost of the OS/file evidence Grype would collect itself.
+
+  This is the *blocking* CVE gate. Dependency-Track (fed by syft-sbom) is the
+  *continuous* one: it keeps re-scanning already-released versions as new CVEs
+  are published. Run both.
+
+inputs:
+  image:
+    description: "Container image reference to scan (prefer <registry>/<name>@sha256:...)"
+    required: false
+    default: ""
+  path:
+    description: "Directory to scan (mutually exclusive with image/sbom)"
+    required: false
+    default: ""
+  sbom:
+    description: "Existing SBOM file to scan (mutually exclusive with image/path)"
+    required: false
+    default: ""
+  severity-cutoff:
+    description: >
+      Lowest severity that fails the step: negligible|low|medium|high|critical.
+      Defaults to `high` rather than scan-action's `medium` — a medium gate is
+      not survivable on a distro base image.
+    required: false
+    default: "high"
+  fail-build:
+    description: "Fail the step when a finding reaches severity-cutoff (false = report only)"
+    required: false
+    default: "true"
+  output-format:
+    description: >
+      sarif | json | table. `table` prints to the log only and produces no
+      report file, so the artifact upload and the `report` output are empty for
+      it. CycloneDX output belongs to the syft-sbom action, not here.
+    required: false
+    default: "sarif"
+  only-fixed:
+    description: "Report only vulnerabilities that have a fix available"
+    required: false
+    default: "false"
+  grype-version:
+    description: "Specific Grype version to install. Empty = the version the action pins."
+    required: false
+    default: ""
+  artifact-name:
+    description: >
+      Attach the report to the run under this artifact name. Empty = do not
+      upload. Uploaded whether or not the gate tripped, so the findings survive
+      a failing build.
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: "Path of the report file Grype wrote (empty for output-format: table)"
+    value: ${{ steps.scan.outputs.sarif || steps.scan.outputs.json }}
+
+runs:
+  using: "composite"
+  steps:
+    # scan-action treats image/path/sbom as mutually exclusive but silently
+    # picks one when several are set, and errors late when none is. A scan of
+    # the wrong target still reports "no vulnerabilities found", which reads
+    # exactly like a clean image — so resolve the ambiguity before scanning.
+    - name: Check scan source
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SRC_PATH: ${{ inputs.path }}
+        SRC_SBOM: ${{ inputs.sbom }}
+        CUTOFF: ${{ inputs.severity-cutoff }}
+      run: |
+        set -euo pipefail
+
+        n=0
+        for src in "$IMAGE" "$SRC_PATH" "$SRC_SBOM"; do
+          [ -n "$src" ] && n=$((n + 1))
+        done
+
+        if [ "$n" -eq 0 ]; then
+          echo "::error::grype-scan: set exactly one of 'image', 'path' or 'sbom' — none was given"
+          exit 1
+        fi
+        if [ "$n" -gt 1 ]; then
+          echo "::error::grype-scan: 'image', 'path' and 'sbom' are mutually exclusive — $n were given"
+          exit 1
+        fi
+
+        case "$CUTOFF" in
+          negligible|low|medium|high|critical) ;;
+          *)
+            echo "::error::grype-scan: 'severity-cutoff' must be one of negligible|low|medium|high|critical (got '$CUTOFF')"
+            exit 1 ;;
+        esac
+
+        if [ -n "$IMAGE" ]; then
+          case "$IMAGE" in
+            *@sha256:*) echo "Scanning image by digest: $IMAGE" ;;
+            *) echo "::warning::grype-scan: scanning image by tag ('$IMAGE'). Pass the digest so the gate cannot apply to a different image than the one just built." ;;
+          esac
+        else
+          echo "Scanning ${SRC_PATH:+directory }${SRC_SBOM:+SBOM }${SRC_PATH}${SRC_SBOM}"
+        fi
+
+        echo "Gate: fail at or above '$CUTOFF'"
+
+    - name: Scan for vulnerabilities (Grype)
+      id: scan
+      uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+      with:
+        image: ${{ inputs.image }}
+        path: ${{ inputs.path }}
+        sbom: ${{ inputs.sbom }}
+        fail-build: ${{ inputs.fail-build }}
+        severity-cutoff: ${{ inputs.severity-cutoff }}
+        output-format: ${{ inputs.output-format }}
+        only-fixed: ${{ inputs.only-fixed }}
+        grype-version: ${{ inputs.grype-version }}
+
+    # `!cancelled()` rather than a bare `if`: the step above exits non-zero when
+    # the gate trips, and the whole point of the report is to say what tripped
+    # it. Keeping it means a failing build still tells you which CVEs to fix.
+    #
+    # The report-path guard covers the two cases where there is no file to
+    # upload: `output-format: table`, which only prints; and a scan that died
+    # before producing output at all (an unreachable registry, say). Without it
+    # upload-artifact rejects the empty `path` as a missing required input, and
+    # that error buries the real one.
+    - name: Upload Grype report
+      if: ${{ !cancelled() && inputs.artifact-name != '' && (steps.scan.outputs.sarif || steps.scan.outputs.json) != '' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.scan.outputs.sarif || steps.scan.outputs.json }}
+        if-no-files-found: error

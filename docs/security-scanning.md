@@ -4,13 +4,21 @@ Four complementary scanners — plus **Cosign** image signing — in the catalog
 across the lifecycle. The first four *detect* problems; Cosign is not a scanner,
 it *proves provenance*: a signature that says "this CI built this exact image".
 
-| Tool | Catches / provides | Where it runs | Building block |
-| --- | --- | --- | --- |
-| **Gitleaks** | Secrets/credentials committed to git | On every push/PR (and locally, pre-commit) | [gitleaks.yml](../.github/workflows/gitleaks.yml) |
-| **Checkov** | Dockerfile misconfigurations (source) | Before the image is built | [docker-build.yml](../.github/workflows/docker-build.yml) (`scan-dockerfile: true`) |
-| **Grype** | Known CVEs in the built image | After an image is built & pushed | [docker-build.yml](../.github/workflows/docker-build.yml) (`scan-image: true`) |
-| **Dockle** | CIS / hardening issues in image layers | After an image is built & pushed | [docker-build.yml](../.github/workflows/docker-build.yml) (`lint-image: true`) |
-| **Cosign** | Image provenance / tamper-evidence (signature) | After push, on the release digest | [docker-build.yml](../.github/workflows/docker-build.yml) (`sign-image: true`) |
+| Tool | Catches / provides | Where it runs | Turn it on with | Composite action |
+| --- | --- | --- | --- | --- |
+| **Gitleaks** | Secrets/credentials committed to git | On every push/PR (and locally, pre-commit) | [gitleaks.yml](../.github/workflows/gitleaks.yml) | [`gitleaks-scan`](../.github/actions/gitleaks-scan/action.yml) |
+| **Checkov** | Dockerfile misconfigurations (source) | Before the image is built | [docker-build.yml](../.github/workflows/docker-build.yml) (`scan-dockerfile: true`) | [`checkov-scan`](../.github/actions/checkov-scan/action.yml) |
+| **Grype** | Known CVEs in the built image | After an image is built & pushed | [docker-build.yml](../.github/workflows/docker-build.yml) (`scan-image: true`) | [`grype-scan`](../.github/actions/grype-scan/action.yml) |
+| **Dockle** | CIS / hardening issues in image layers | After an image is built & pushed | [docker-build.yml](../.github/workflows/docker-build.yml) (`lint-image: true`) | — (inline) |
+| **Cosign** | Image provenance / tamper-evidence (signature) | After push, on the release digest | [docker-build.yml](../.github/workflows/docker-build.yml) (`sign-image: true`) | [`cosign-sign`](../.github/actions/cosign-sign/action.yml) |
+
+Every tool but Dockle is packaged as a **composite action** that owns its pinned
+SHA, its input validation and its report handling; the reusable workflows just
+wire them together with the toggles above. Use the workflow toggles for the
+common path, and the actions directly when you already have a job of your own —
+see [Using the scanners as plain steps](#using-the-scanners-as-plain-steps).
+[`syft-sbom`](../.github/actions/syft-sbom/action.yml) rounds out the set on the
+SBOM side.
 
 Checkov and Dockle are two halves of the same concern seen from different sides:
 Checkov lints the **Dockerfile source** *before* the build; Dockle lints the
@@ -107,14 +115,22 @@ fast (no wasted build/login). It needs no secret.
 | `scan-dockerfile` | `false` | Turn the Checkov lint on. |
 | `scan-dockerfile-soft-fail` | `false` | `true` = report findings but don't fail the build. |
 
-Checkov runs in its own `dockerfile-lint` job that the `docker` build job
-depends on — not as a step inside it. `checkov-action` is a *container* action,
+Checkov runs through the [`checkov-scan`](../.github/actions/checkov-scan/action.yml)
+action, in its own `dockerfile-lint` job that the `docker` build job depends on —
+not as a step inside it. The `checkov-action` it wraps is a *container* action,
 and the runner pulls the image of every container action in a job during **Set
 up job**, before any step-level `if:` is evaluated. As a step it pulled
 `ghcr.io/bridgecrewio/checkov` on every build even with `scan-dockerfile: false`
 — fatal on a runner without ghcr.io egress. A job-level `if` skips the job
-outright, so nothing is pulled when the lint is off. Keep this in mind before
-folding any other container action into the build job.
+outright, so nothing is pulled when the lint is off. Wrapping it in a composite
+action does not change that, which is why `checkov-scan` says so in its own
+description: gate it at job level. Keep this in mind before folding any other
+container action into the build job.
+
+`checkov-scan` also lints Kubernetes manifests, Terraform, Helm charts and
+GitHub Actions workflows — pass `directory` plus the matching `framework`
+instead of `file`/`dockerfile`. `docker-build.yml` only wires up the Dockerfile
+case.
 
 ```yaml
 jobs:
@@ -142,6 +158,24 @@ USER app
 Suppress a specific rule inline with a `#checkov:skip=<id>:<reason>` comment in
 the Dockerfile, or narrow the run with Checkov's `check` / `skip_check` inputs.
 
+**How `python-demo` is configured, and why.** Both of its Dockerfiles pass every
+Checkov check except `CKV_DOCKER_2` (no `HEALTHCHECK`) — 46 of 47 on
+`Dockerfile.local`, 51 of 52 on `Dockerfile.registry`. The image is a one-shot
+CLI (`ENTRYPOINT ["python-demo"]` / `CMD ["10"]`): it runs, prints, and exits, so
+there is no long-lived process for a healthcheck to poll and the check is not
+meaningful here. The caller therefore runs the lint in **report-only** mode:
+
+```yaml
+      scan-dockerfile: true
+      scan-dockerfile-soft-fail: true
+```
+
+Note what soft-fail does *not* cover on its own: `dockerfile-lint` can fail
+during **Set up job**, pulling `ghcr.io/bridgecrewio/checkov`, before Checkov
+ever runs. The `docker` job's gate treats `scan-dockerfile-soft-fail` as "never
+block" for exactly that reason — otherwise a report-only lint would still stop
+the build when the runner cannot reach ghcr.io.
+
 ---
 
 ## Grype — image vulnerability scanning
@@ -160,7 +194,13 @@ vulnerability at or above the cutoff is found.
 
 The scan runs **after** the image SBOM is uploaded to Dependency-Track, so the
 inventory is recorded even when the gate trips. The Grype result is always
-attached to the run as a SARIF artifact (`grype-<image-name>-scan`), pass or fail.
+attached to the run as a SARIF artifact (`grype-<image-name>-scan`), pass or fail
+— [`grype-scan`](../.github/actions/grype-scan/action.yml) uploads it under
+`!cancelled()`, precisely so the run that failed the gate still tells you which
+CVEs to fix.
+
+Outside an image build, the same action scans a `path` or an existing `sbom` —
+see [Using the scanners as plain steps](#using-the-scanners-as-plain-steps).
 
 ### Composed-primitive caller
 
@@ -278,6 +318,65 @@ jobs:
 
 `node-workflow.yml` exposes the same `sign-image` toggle and forwards it to
 `docker-build.yml`.
+
+## Using the scanners as plain steps
+
+The toggles above are the easy path, but they assume you are calling
+`docker-build.yml` / `gitleaks.yml`. When you already have a job of your own,
+reference the composite actions directly — one step each, pinned SHAs and
+report handling included. Use the **full** `owner/repo/path@ref` form; a local
+`./.github/actions/...` path resolves against your workspace, not the catalog's.
+
+```yaml
+jobs:
+  security:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # gitleaks needs the history it is asked to scan
+
+      - name: Secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/gitleaks-scan@develop
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          license: ${{ secrets.GITLEAKS_LICENSE }}
+
+      # Dependencies of the source tree, no image required.
+      - name: SBOM
+        id: sbom
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/syft-sbom@develop
+        with:
+          path: .
+          output-file: sbom.cdx.json
+          artifact-name: sbom-my-app
+
+      - name: CVE gate
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/grype-scan@develop
+        with:
+          sbom: ${{ steps.sbom.outputs.bom-file }}   # or image: <ref>@<digest>
+          severity-cutoff: high
+          artifact-name: grype-my-app
+```
+
+Two things the actions will not paper over:
+
+- **`checkov-scan` must be gated at job level, never step level.** It wraps a
+  *container* action, and the runner pulls the image of every container action
+  in a job during **Set up job** — before any step `if:` is evaluated. A step
+  `if: false` still costs you the `ghcr.io/bridgecrewio/checkov` pull, which is
+  fatal on a runner without ghcr.io egress. Give it its own job with a
+  job-level `if`, as [`docker-build.yml`](../.github/workflows/docker-build.yml)
+  does with `dockerfile-lint`.
+- **Pass images by digest.** `syft-sbom` and `grype-scan` both warn on a
+  tag-only reference: a tag can move between the push and the scan, so the gate
+  and the published inventory would describe an image you did not build. Use
+  `${{ steps.build.outputs.digest }}` from `docker/build-push-action`.
+
+Scanning the SBOM instead of the image (as above) saves the second registry pull
+and guarantees the gate and Dependency-Track see the same inventory — at the
+cost of the extra file/OS evidence Grype collects when it catalogs an image
+itself. Both are supported; `docker-build.yml` scans the image.
 
 ## Local usage
 

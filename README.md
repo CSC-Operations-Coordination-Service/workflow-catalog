@@ -20,6 +20,11 @@ full building-block reference, composition styles, use cases, and conventions.
 | [`node-workflow.yml`](.github/workflows/node-workflow.yml) | reusable workflow | Node/React CI (all-in-one, toggleable) |
 | [`nexus-context`](.github/actions/nexus-context/action.yml) | composite action | pip/twine config for a Nexus dev/prod context |
 | [`dependency-track-upload`](.github/actions/dependency-track-upload/action.yml) | composite action | Upload a CycloneDX SBOM to Dependency-Track |
+| [`gitleaks-scan`](.github/actions/gitleaks-scan/action.yml) | composite action | Gitleaks secret scan of the checked-out repo |
+| [`checkov-scan`](.github/actions/checkov-scan/action.yml) | composite action | Checkov IaC misconfiguration lint (Dockerfile, K8s, Terraform, …) |
+| [`syft-sbom`](.github/actions/syft-sbom/action.yml) | composite action | Syft CycloneDX SBOM of an image, directory or file |
+| [`grype-scan`](.github/actions/grype-scan/action.yml) | composite action | Grype CVE gate on an image, directory or SBOM |
+| [`cosign-sign`](.github/actions/cosign-sign/action.yml) | composite action | Cosign key-based image signing, by digest |
 | [`python-demo.yml`](.github/workflows/python-demo.yml) | caller | Builds the in-repo `python-demo` example |
 
 ## Docs

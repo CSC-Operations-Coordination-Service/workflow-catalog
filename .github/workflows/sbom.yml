@@ -4,6 +4,10 @@ name: Package SBOM (reusable)
 # Dependency-Track. Consumes the `dist` artifact produced by python-ci.yml,
 # installs the wheel into an isolated env, and inventories it with cyclonedx-py.
 #
+# Two jobs: `sbom` builds the inventory in a python container, `publish` uploads
+# it from the runner host (see the comment on that job — an internal
+# Dependency-Track is not reachable from inside a job container).
+#
 # Pass secrets with `secrets: inherit`. Consumes these repository secrets:
 #   DEPENDENCYTRACK_URL, DEPENDENCYTRACK_API_KEY
 #
@@ -88,15 +92,6 @@ jobs:
           path: ${{ inputs.project-dir }}/sbom-python.cdx.json
           if-no-files-found: error
 
-      - name: Upload package SBOM to Dependency-Track
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
-        with:
-          bom-file: ${{ inputs.project-dir }}/sbom-python.cdx.json
-          project-name: ${{ inputs.project-name }}
-          project-version: ${{ inputs.project-version }}
-          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
-          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
-
       # This job container runs as root, so the bind-mounted workspace it leaves
       # behind (including .git/) is owned by uid 0. On a self-hosted runner the
       # next job of the run reuses that same directory, and any job without
@@ -112,3 +107,39 @@ jobs:
           else
             echo "::warning::could not fully chown $GITHUB_WORKSPACE to $owner — a later non-container job may fail to check out"
           fi
+
+  # Publishing runs on the runner itself, deliberately without `container:`.
+  # Dependency-Track is an internal service, and a job container sits on the
+  # docker bridge with its own resolver and no route to a host-published port —
+  # from there the upload dies as
+  #   curl: (7) Failed to connect to *** port 5055 after 1 ms
+  # (connect refused, ~0 ms, so nothing left the runner). The sibling image-SBOM
+  # upload in docker-build.yml already reaches the same server from a
+  # non-container job, and the SonarQube jobs in python-ci.yml only reach their
+  # host-side server via an explicit --add-host=host.docker.internal:host-gateway
+  # alias. Uploading from the host needs neither workaround and keeps working
+  # wherever the server actually lives.
+  #
+  # Only the SBOM file crosses over, via the artifact the job above uploaded —
+  # no checkout, no Python, no Nexus context needed here. With no checkout the
+  # composite action below must stay referenced as owner/repo/path@ref (a local
+  # ./.github/actions/... path would resolve against an empty workspace).
+  publish:
+    needs: sbom
+    runs-on: self-hosted
+
+    steps:
+      - name: Download package SBOM
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: sbom-${{ inputs.project-name }}-package
+          path: sbom
+
+      - name: Upload package SBOM to Dependency-Track
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
+        with:
+          bom-file: sbom/sbom-python.cdx.json
+          project-name: ${{ inputs.project-name }}
+          project-version: ${{ inputs.project-version }}
+          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}

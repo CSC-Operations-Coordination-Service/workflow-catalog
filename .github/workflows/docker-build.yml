@@ -172,11 +172,11 @@ jobs:
   # before anything is built or pushed, so a bad Dockerfile fails fast. Set
   # scan-dockerfile-soft-fail to warn instead of block. Language-agnostic.
   #
-  # This is a separate job on purpose, not a step in `docker`. checkov-action is
-  # a *container* action (`runs: using: docker`), and the runner pulls the image
-  # of every container action in a job during "Set up job" — before any
-  # step-level `if:` is evaluated. As a step it therefore pulled
-  # ghcr.io/bridgecrewio/checkov on every single build, even with
+  # This is a separate job on purpose, not a step in `docker`. The checkov-action
+  # that `checkov-scan` wraps is a *container* action (`runs: using: docker`), and
+  # the runner pulls the image of every container action in a job during "Set up
+  # job" — before any step-level `if:` is evaluated. As a step it therefore
+  # pulled ghcr.io/bridgecrewio/checkov on every single build, even with
   # scan-dockerfile false, which breaks runners that cannot reach ghcr.io. A
   # job-level `if` skips the job outright, so nothing is pulled.
   # ---------------------------------------------------------------------------
@@ -190,12 +190,11 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Lint Dockerfile (Checkov)
-        uses: bridgecrewio/checkov-action@d9d1e5cdc53e3a91f0c4c58db7bc19ee31cac7e5 # v12.3113.0
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/checkov-scan@develop
         with:
           file: ${{ inputs.dockerfile }}
           framework: dockerfile
-          soft_fail: ${{ inputs.scan-dockerfile-soft-fail }}
-          output_format: cli
+          soft-fail: ${{ inputs.scan-dockerfile-soft-fail }}
 
   docker:
     needs: dockerfile-lint
@@ -203,7 +202,17 @@ jobs:
     # build unless the lint actually failed. Keeps the fail-fast behaviour
     # (no build/login when the Dockerfile is bad) while letting the common
     # scan-dockerfile: false path through.
-    if: ${{ !cancelled() && needs.dockerfile-lint.result != 'failure' }}
+    #
+    # scan-dockerfile-soft-fail additionally means "never block", and that has
+    # to hold for a lint job that failed *before* Checkov ran: checkov-action is
+    # a container action, so the runner pulls ghcr.io/bridgecrewio/checkov during
+    # "Set up job", and on a runner without ghcr.io egress the job fails there.
+    # Without this clause a report-only lint would still stop the build — the one
+    # thing report-only promises not to do.
+    if: >-
+      ${{ !cancelled()
+          && (inputs.scan-dockerfile-soft-fail
+              || needs.dockerfile-lint.result != 'failure') }}
     runs-on: self-hosted
     permissions:
       contents: read
@@ -505,28 +514,21 @@ jobs:
       # Syft pulls the image by digest from the Nexus registry (already logged in
       # above). Language-agnostic: any caller passing generate-sbom gets this.
       # -----------------------------------------------------------------------
-      - name: Generate image SBOM (CycloneDX)
+      - name: Generate image SBOM (Syft)
+        id: sbom
         if: inputs.generate-sbom
-        uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb # v0.17.7
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/syft-sbom@develop
         with:
           image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: sbom-image.cdx.json
-          upload-artifact: false
-
-      - name: Upload image SBOM artifact
-        if: inputs.generate-sbom
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: sbom-${{ inputs.image-name }}-image
-          path: sbom-image.cdx.json
-          if-no-files-found: error
+          artifact-name: sbom-${{ inputs.image-name }}-image
 
       - name: Upload image SBOM to Dependency-Track
         if: inputs.generate-sbom
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
         with:
-          bom-file: sbom-image.cdx.json
+          bom-file: ${{ steps.sbom.outputs.bom-file }}
           project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || format('{0}-image', inputs.image-name) }}
           project-version: ${{ inputs.sbom-project-version }}
           server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
@@ -540,25 +542,18 @@ jobs:
       # SBOM feature above. Runs after the SBOM upload so the inventory is
       # recorded even when the gate trips. Language-agnostic.
       # -----------------------------------------------------------------------
+      # The action keeps the SARIF report whether the scan passed or tripped the
+      # gate, so a failing build still says which CVEs to fix.
       - name: Scan image for vulnerabilities (Grype)
         id: scan
         if: inputs.scan-image
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/grype-scan@develop
         with:
           image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
           fail-build: ${{ inputs.scan-fail-build }}
           severity-cutoff: ${{ inputs.scan-severity-cutoff }}
           output-format: sarif
-
-      - name: Upload Grype scan report (SARIF)
-        # Runs whether the scan passed or tripped the gate, so the report is
-        # always kept; skipped only when scanning is off or the job is cancelled.
-        if: ${{ !cancelled() && inputs.scan-image }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: grype-${{ inputs.image-name }}-scan
-          path: ${{ steps.scan.outputs.sarif }}
-          if-no-files-found: warn
+          artifact-name: grype-${{ inputs.image-name }}-scan
 
       # -----------------------------------------------------------------------
       # Image hardening lint — Dockle checks the pushed image against the CIS

@@ -45,22 +45,41 @@ workflow via `secrets: inherit`):
 | `DEPENDENCYTRACK_URL`     | Base URL of the Dependency-Track API server (no trailing `/api`), e.g. `http://host.docker.internal:8081`. Must be reachable from the self-hosted runners, the same way Nexus is. |
 | `DEPENDENCYTRACK_API_KEY` | A Dependency-Track team API key. For upload-only, it needs **`BOM_UPLOAD`**, **`PROJECT_CREATION_UPLOAD`**, and **`VIEW_PORTFOLIO`**. |
 
-## The shared upload primitive
+## The shared primitives
 
-All uploads go through one composite action,
-[.github/actions/dependency-track-upload](../.github/actions/dependency-track-upload/action.yml),
-which POSTs a CycloneDX file to `${DEPENDENCYTRACK_URL}/api/v1/bom`. Any job that
-produces a CycloneDX file can reuse it:
+Two composite actions, split so either half can be swapped or reused alone:
+
+- [`syft-sbom`](../.github/actions/syft-sbom/action.yml) — **generate** a
+  CycloneDX SBOM with Syft from an image, a directory or a single file, and
+  optionally attach it to the run. Outputs `bom-file`.
+- [`dependency-track-upload`](../.github/actions/dependency-track-upload/action.yml)
+  — **publish** a CycloneDX file to `${DEPENDENCYTRACK_URL}/api/v1/bom`.
+  Tool-agnostic: it does not care whether Syft, `cyclonedx-py` or
+  `cyclonedx-npm` produced the file, which is why the Python and npm SBOMs use
+  their own generators and the same uploader.
+
+Chained, that is the whole image-SBOM path in `docker-build.yml`:
 
 ```yaml
-- uses: ./.github/actions/dependency-track-upload
+- id: sbom
+  uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/syft-sbom@develop
   with:
-    bom-file: path/to/bom.json
+    image: ${{ env.REGISTRY }}/my-component@${{ steps.build.outputs.digest }}
+    output-file: sbom-image.cdx.json
+    artifact-name: sbom-my-component-image
+
+- uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
+  with:
+    bom-file: ${{ steps.sbom.outputs.bom-file }}
     project-name: my-component
     project-version: ${{ needs.build.outputs.version }}
     server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
     api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
 ```
+
+Pass the image **by digest**, as above: a tag can move between the push and the
+scan, and an inventory recorded against the wrong image is worse than none.
+`syft-sbom` warns when you give it a tag.
 
 ## Adding the upcoming React app
 
@@ -82,6 +101,17 @@ Dependency-Track project automatically — no manual pre-registration.
 - **Project = name + version.** Keep `projectName` stable and let `projectVersion`
   track the release tag. Dependency-Track then shows a version timeline and the
   "affected versions" for each CVE.
+- **Upload from the host, not from a job container.** Dependency-Track is an
+  internal server; a job container has its own resolver and no route to a port
+  published on the runner host, so the upload dies as
+  `curl: (7) Failed to connect to *** port 5055 after 1 ms` — connect refused in
+  ~0 ms, i.e. nothing left the runner. Generate the SBOM wherever the build tools
+  live, publish it as an artifact, and upload it from a job with no `container:`
+  (`publish` in [sbom.yml](../.github/workflows/sbom.yml), `sbom-publish` in
+  [node-workflow.yml](../.github/workflows/node-workflow.yml)). The alternative —
+  `--add-host=host.docker.internal:host-gateway` on the container plus a URL
+  pointing at that alias — only works when the server is on the runner host
+  itself. The action preflights the connection and prints both causes.
 - **Least-privilege API key.** Upload-only needs just `BOM_UPLOAD` +
   `PROJECT_CREATION_UPLOAD` + `VIEW_PORTFOLIO`. Add `VIEW_VULNERABILITY` /
   `POLICY_VIOLATION_*` only if/when you introduce a quality gate.

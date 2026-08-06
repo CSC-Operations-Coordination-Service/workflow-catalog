@@ -1,0 +1,118 @@
+name: "Syft SBOM generation"
+description: >
+  Catalog a container image, a directory or a single file with Syft and write a
+  CycloneDX (or SPDX) SBOM, optionally attaching it to the run as an artifact.
+  Pair it with the dependency-track-upload action to publish the result.
+
+  Exactly one source must be given — image, path or file. For an `image`, Syft
+  pulls the reference itself, so the runner must already be logged in to that
+  registry (Syft reuses the Docker credentials). Pass the image **by digest**
+  so the inventory is bound to the exact image that was built rather than to a
+  tag that can move.
+
+inputs:
+  image:
+    description: "Container image reference to catalog (prefer <registry>/<name>@sha256:...)"
+    required: false
+    default: ""
+  path:
+    description: "Directory to catalog (mutually exclusive with image/file)"
+    required: false
+    default: ""
+  file:
+    description: "Single file to catalog, e.g. a wheel or a jar (mutually exclusive with image/path)"
+    required: false
+    default: ""
+  format:
+    description: >
+      Syft output format: cyclonedx-json, cyclonedx-xml, spdx-json, syft-json,
+      ... Dependency-Track ingests CycloneDX, which is why that is the default
+      here even though Syft's own default is SPDX.
+    required: false
+    default: "cyclonedx-json"
+  output-file:
+    description: "Where to write the SBOM. Also the action's `bom-file` output."
+    required: false
+    default: "sbom.cdx.json"
+  artifact-name:
+    description: >
+      Attach the SBOM to the run under this artifact name. Empty = do not
+      upload (e.g. when the SBOM is only being forwarded to Dependency-Track).
+    required: false
+    default: ""
+  syft-version:
+    description: "Specific Syft version to install. Empty = the version the action pins."
+    required: false
+    default: ""
+
+outputs:
+  bom-file:
+    description: "Path of the SBOM that was written (echoes output-file)"
+    value: ${{ inputs.output-file }}
+
+runs:
+  using: "composite"
+  steps:
+    # sbom-action resolves its source as image -> file -> path and throws a bare
+    # "Invalid input, no image or path specified" when all three are empty. Its
+    # `path` input also defaults to ".", so a typo'd image reference would
+    # silently fall through to cataloguing the workspace and produce a
+    # plausible-looking SBOM of the wrong thing. Decide the source here instead.
+    - name: Check SBOM source
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        SRC_PATH: ${{ inputs.path }}
+        SRC_FILE: ${{ inputs.file }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+
+        n=0
+        for src in "$IMAGE" "$SRC_PATH" "$SRC_FILE"; do
+          [ -n "$src" ] && n=$((n + 1))
+        done
+
+        if [ "$n" -eq 0 ]; then
+          echo "::error::syft-sbom: set exactly one of 'image', 'path' or 'file' — none was given"
+          exit 1
+        fi
+        if [ "$n" -gt 1 ]; then
+          echo "::error::syft-sbom: 'image', 'path' and 'file' are mutually exclusive — $n were given"
+          exit 1
+        fi
+        if [ -z "$OUTPUT_FILE" ]; then
+          echo "::error::syft-sbom: 'output-file' must not be empty — it is the path the SBOM is written to and the action's bom-file output"
+          exit 1
+        fi
+
+        if [ -n "$IMAGE" ]; then
+          case "$IMAGE" in
+            *@sha256:*) echo "Cataloguing image by digest: $IMAGE" ;;
+            *) echo "::warning::syft-sbom: cataloguing image by tag ('$IMAGE'). Pass the digest so the SBOM cannot drift from the image that was built." ;;
+          esac
+        else
+          echo "Cataloguing ${SRC_PATH:+directory }${SRC_FILE:+file }${SRC_PATH}${SRC_FILE}"
+        fi
+
+    - name: Generate SBOM (Syft)
+      uses: anchore/sbom-action@fc46e51fd3cb168ffb36c6d1915723c47db58abb # v0.17.7
+      with:
+        image: ${{ inputs.image }}
+        path: ${{ inputs.path }}
+        file: ${{ inputs.file }}
+        format: ${{ inputs.format }}
+        output-file: ${{ inputs.output-file }}
+        syft-version: ${{ inputs.syft-version }}
+        # sbom-action's own uploader derives the artifact name from the image or
+        # the job name, which collides as soon as one job builds two SBOMs.
+        # Upload below instead, under a name the caller controls.
+        upload-artifact: false
+
+    - name: Upload SBOM artifact
+      if: ${{ inputs.artifact-name != '' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.output-file }}
+        if-no-files-found: error

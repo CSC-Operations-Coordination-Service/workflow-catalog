@@ -1,0 +1,111 @@
+name: "Checkov IaC scan"
+description: >
+  Lint infrastructure-as-code — Dockerfile, Kubernetes, Terraform, GitHub
+  Actions, ... — for security misconfigurations with Checkov. Source-level and
+  pre-build, so a bad Dockerfile fails before anything is built or pushed.
+  Needs no secret.
+
+  IMPORTANT — checkov-action is a *container* action, and the runner pulls the
+  image of every container action reachable from a job during "Set up job",
+  before any step-level `if:` is evaluated. Gating this action with a step `if:`
+  therefore does NOT avoid the pull: every run fetches
+  ghcr.io/bridgecrewio/checkov, which fails outright on a runner with no
+  ghcr.io egress. Put it in its own job and gate that job with a *job-level*
+  `if` — see docker-build.yml's `dockerfile-lint`.
+
+inputs:
+  file:
+    description: >
+      File to scan (e.g. the Dockerfile). Takes precedence over `directory`:
+      Checkov's entrypoint uses the directory only when this is empty.
+    required: false
+    default: ""
+  directory:
+    description: "Directory to scan when `file` is empty"
+    required: false
+    default: "."
+  framework:
+    description: >
+      Restrict the run to specific frameworks, comma- or space-separated (e.g.
+      'dockerfile', 'kubernetes,secrets'). Empty = every framework Checkov
+      supports, which on a repo of this shape means a much slower scan and
+      findings from files you did not mean to gate on.
+    required: false
+    default: ""
+  soft-fail:
+    description: "Report findings without failing the step (true = warn only)"
+    required: false
+    default: "false"
+  output-format:
+    description: >
+      cli | json | junitxml | github_failed_only | sarif (comma-separated).
+      Defaults to `cli` rather than checkov-action's `sarif` so the findings are
+      readable in the job log without an extra download.
+    required: false
+    default: "cli"
+  output-file-path:
+    description: "Write the report here instead of only to the log. Needs a trailing comma for a single format (Checkov's own convention)."
+    required: false
+    default: ""
+  check:
+    description: "Run only these check IDs, comma-separated (e.g. 'CKV_DOCKER_2,CKV_DOCKER_3')"
+    required: false
+    default: ""
+  skip-check:
+    description: "Run every check except these IDs, comma-separated"
+    required: false
+    default: ""
+  config-file:
+    description: "Path to a .checkov.yaml configuration file"
+    required: false
+    default: ""
+  quiet:
+    description: "Print only failed checks"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check scan target
+      shell: bash
+      env:
+        FILE: ${{ inputs.file }}
+        DIRECTORY: ${{ inputs.directory }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$FILE" ]; then
+          if [ ! -f "$FILE" ]; then
+            # Checkov exits 0 having scanned nothing when handed a path that
+            # does not exist, so the job goes green and the gate never ran.
+            echo "::error::checkov-scan: 'file' does not exist: $FILE (paths are relative to the repository root — is the caller missing an actions/checkout?)"
+            exit 1
+          fi
+          echo "Scanning file: $FILE"
+        else
+          if [ ! -d "$DIRECTORY" ]; then
+            echo "::error::checkov-scan: 'directory' does not exist: $DIRECTORY"
+            exit 1
+          fi
+          echo "Scanning directory: $DIRECTORY"
+        fi
+
+    - name: Scan IaC (Checkov)
+      uses: bridgecrewio/checkov-action@d9d1e5cdc53e3a91f0c4c58db7bc19ee31cac7e5 # v12.3113.0
+      with:
+        file: ${{ inputs.file }}
+        directory: ${{ inputs.directory }}
+        framework: ${{ inputs.framework }}
+        # Mapped to '' rather than 'false' deliberately. Checkov's entrypoint
+        # enables the flag only on the exact string "true", but it picks the
+        # *problem matcher* on `-z "$INPUT_SOFT_FAIL"` — so a literal "false"
+        # downgrades every annotation to a warning while the step still fails,
+        # which reads as a passing scan in the Files-changed view.
+        soft_fail: ${{ inputs.soft-fail == 'true' && 'true' || '' }}
+        output_format: ${{ inputs.output-format }}
+        output_file_path: ${{ inputs.output-file-path }}
+        check: ${{ inputs.check }}
+        skip_check: ${{ inputs.skip-check }}
+        config_file: ${{ inputs.config-file }}
+        quiet: ${{ inputs.quiet }}

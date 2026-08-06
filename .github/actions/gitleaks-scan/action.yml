@@ -1,0 +1,91 @@
+name: "Gitleaks secret scan"
+description: >
+  Scan the checked-out repository for committed secrets with Gitleaks.
+
+  gitleaks-action scopes the scan from the triggering event — the pushed commit
+  range on `push`, the PR commits on `pull_request`, the full history otherwise
+  — so the caller must check the repo out with `fetch-depth: 0`. A shallow clone
+  leaves those commits missing and the scan silently covers less than the green
+  check suggests.
+
+  Needs nothing from the internal network: the action downloads the gitleaks
+  binary from GitHub releases, so any runner with GitHub egress can run it (no
+  Nexus, no proxy, no internal registry).
+
+inputs:
+  github-token:
+    description: "GITHUB_TOKEN — reads the event's commits and writes the PR annotation"
+    required: true
+  license:
+    description: >
+      Gitleaks license key — pass the GITLEAKS_LICENSE secret. REQUIRED on
+      organization repositories (gitleaks-action is free on personal ones).
+      Store it as an organization secret so every repo shares it, and check
+      that the repo is in the secret's access list.
+    required: false
+    default: ""
+  version:
+    description: >
+      Gitleaks release to run (e.g. '8.24.3'). Empty = the version the action
+      pins itself, which is the safer default: a version this catalog does not
+      test can change the ruleset under you.
+    required: false
+    default: ""
+  enable-summary:
+    description: "Write the findings table to the run's job summary"
+    required: false
+    default: "true"
+  enable-comments:
+    description: "Comment on the offending lines of a pull request"
+    required: false
+    default: "true"
+  enable-upload-artifact:
+    description: "Attach the gitleaks SARIF report to the run as an artifact"
+    required: false
+    default: "true"
+  notify-user-list:
+    description: "Comma-separated @handles cc'd on the PR comment (e.g. '@alice,@bob')"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # gitleaks-action does exit non-zero without a licence, but its message does
+    # not say where the key belongs — and on an organization repo the usual
+    # cause is an org secret that simply has not been granted to this repo, not
+    # a missing key. Name the secret while the cause is still obvious.
+    - name: Check Gitleaks license
+      shell: bash
+      env:
+        LICENSE: ${{ inputs.license }}
+        OWNER_TYPE: ${{ github.event.repository.owner.type }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$LICENSE" ]; then
+          echo "Gitleaks license supplied (${#LICENSE} characters)."
+        elif [ "$OWNER_TYPE" = "Organization" ]; then
+          echo "::error::gitleaks-scan: 'license' is empty and $GITHUB_REPOSITORY belongs to an organization, where gitleaks-action requires a licence. Get a key at https://gitleaks.io, store it as the GITLEAKS_LICENSE organization secret, and add this repo to the secret's access list."
+          exit 1
+        else
+          # Personal repo, or an event that carries no repository owner (e.g.
+          # schedule on some runner versions) — let the scan decide.
+          echo "No Gitleaks license supplied; gitleaks-action is free on personal repositories."
+        fi
+
+    - name: Gitleaks scan
+      uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITLEAKS_LICENSE: ${{ inputs.license }}
+        # gitleaks-action has no action inputs at all — every knob is an env
+        # var, read as `process.env.X || <default>` for the version and
+        # `process.env.X == "false"` for the toggles. An empty value therefore
+        # means "keep the default", never "off", so forwarding an unset input
+        # verbatim is safe.
+        GITLEAKS_VERSION: ${{ inputs.version }}
+        GITLEAKS_ENABLE_SUMMARY: ${{ inputs.enable-summary }}
+        GITLEAKS_ENABLE_COMMENTS: ${{ inputs.enable-comments }}
+        GITLEAKS_ENABLE_UPLOAD_ARTIFACT: ${{ inputs.enable-upload-artifact }}
+        GITLEAKS_NOTIFY_USER_LIST: ${{ inputs.notify-user-list }}

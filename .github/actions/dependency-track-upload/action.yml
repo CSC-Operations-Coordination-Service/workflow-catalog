@@ -39,19 +39,60 @@ runs:
       run: |
         set -euo pipefail
 
-        if [ ! -f "$DT_BOM_FILE" ]; then
-          echo "::error::SBOM file not found: $DT_BOM_FILE"
-          exit 1
+        fail() { echo "::error::$1"; exit 1; }
+
+        [ -n "$DT_SERVER_URL" ] || fail "server-url is empty. Set the DEPENDENCYTRACK_URL secret; for an organization secret, check that this repo is in its access list."
+        [ -n "$DT_API_KEY" ] || fail "api-key is empty. Set the DEPENDENCYTRACK_API_KEY secret; for an organization secret, check that this repo is in its access list."
+        [ -f "$DT_BOM_FILE" ] || fail "SBOM file not found: $DT_BOM_FILE"
+
+        base=${DT_SERVER_URL%/}
+
+        # Reachability preflight. Dependency-Track is typically an internal
+        # server, and the log masks its URL as ***, so a bare `curl: (7) Failed
+        # to connect to *** port 5055` gives nothing to act on — and the two
+        # causes need opposite fixes. Probe the unauthenticated /api/version
+        # first and report which one it is. curl's own stderr is kept: it
+        # distinguishes "Could not resolve host" (exit 6) from "Could not connect
+        # to server" (exit 7).
+        err=$(mktemp)
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$base/api/version" 2>"$err") || code=000
+
+        if [ "$code" = "000" ]; then
+          cat "$err"
+          echo "Two causes look alike here, and they need opposite fixes:"
+          echo "  (a) this step is running inside a job container. A container has"
+          echo "      its own resolver and no route to a port published on the"
+          echo "      runner host, so an internal server is unreachable from it."
+          echo "      Run the upload from a job with no 'container:', or add"
+          echo "      --add-host=host.docker.internal:host-gateway to the container"
+          echo "      and point the URL at that alias."
+          echo "  (b) the host or port is wrong, or a firewall rejects it. Verify"
+          echo "      from the runner itself: curl -v <server-url>/api/version"
+          fail "Cannot reach the Dependency-Track server from this job (see the two causes above)."
         fi
+
+        echo "Dependency-Track reachable (HTTP $code from /api/version)"
 
         echo "Uploading '$DT_BOM_FILE' to Dependency-Track project" \
              "'$DT_PROJECT_NAME' version '$DT_PROJECT_VERSION'"
 
-        curl -sSf -X POST "${DT_SERVER_URL%/}/api/v1/bom" \
+        resp=$(mktemp)
+        code=$(curl -sS -X POST "$base/api/v1/bom" \
           -H "X-Api-Key: ${DT_API_KEY}" \
           -F "autoCreate=${DT_AUTOCREATE}" \
           -F "projectName=${DT_PROJECT_NAME}" \
           -F "projectVersion=${DT_PROJECT_VERSION}" \
-          -F "bom=@${DT_BOM_FILE}"
+          -F "bom=@${DT_BOM_FILE}" \
+          -o "$resp" -w '%{http_code}' 2>"$err") || code=000
 
-        echo "SBOM upload accepted by Dependency-Track."
+        case "$code" in
+          200|201)
+            echo "SBOM upload accepted by Dependency-Track." ;;
+          401|403)
+            fail "Dependency-Track rejected the API key (HTTP $code). It needs the BOM_UPLOAD permission, plus PROJECT_CREATION_UPLOAD when autocreate creates the project/version." ;;
+          000)
+            cat "$err"
+            fail "The upload request did not complete, although /api/version answered a moment earlier." ;;
+          *)
+            fail "Dependency-Track returned HTTP $code: $(head -c 300 "$resp")" ;;
+        esac

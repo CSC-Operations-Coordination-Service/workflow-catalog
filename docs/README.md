@@ -13,16 +13,22 @@ and composite actions — shared across projects. It is consumed two ways:
 
 Three layers, from fine-grained to coarse:
 
-```
+```text
 callers (triggers)          python-demo.yml          <your-app>.yml (in your repo)
         │  uses:                  │                         │
         ▼                         ▼                         ▼
-reusable workflows     python-ci.yml  sbom.yml  docker-build.yml  node-workflow.yml
-(jobs)                        │            │            │                 │
-        │  uses:              ▼            ▼            ▼                 ▼
-composite actions            nexus-context        dependency-track-upload
-(steps)
+reusable workflows  python-ci.yml  sbom.yml  docker-build.yml  gitleaks.yml  node-workflow.yml
+(jobs)                     │           │            │              │              │
+        │  uses:           ▼           ▼            ▼              ▼              ▼
+composite actions      nexus-context   dependency-track-upload   cosign-sign
+(steps)                gitleaks-scan   checkov-scan   syft-sbom   grype-scan
 ```
+
+One tool per action, on purpose: each scanner/signer is a composite action that
+owns its pinned SHA, its input validation and its report handling, and the
+reusable workflows only wire them together. A job that already exists in your
+own repo can therefore drop in a single scanner step without adopting a whole
+workflow.
 
 - **Composite actions** = single-responsibility *steps* you drop into any job.
 - **Reusable workflows** = whole *jobs* (`on: workflow_call`) you call with `uses:`.
@@ -38,6 +44,10 @@ composite actions            nexus-context        dependency-track-upload
 | [`nexus-context`](../.github/actions/nexus-context/action.yml) | Configure pip + twine for a Nexus `dev`/`prod` context (writes `pip.conf` / `.pypirc`, exports `PIP_CONFIG_FILE` + `TWINE_REPOSITORY`). | `context` (dev/prod), `config-dir` |
 | [`dependency-track-upload`](../.github/actions/dependency-track-upload/action.yml) | Upload a CycloneDX SBOM to Dependency-Track (`POST /api/v1/bom`). Language/tool-agnostic. | `bom-file`, `project-name`, `project-version`, `server-url`, `api-key` |
 | [`cosign-sign`](../.github/actions/cosign-sign/action.yml) | Install Cosign and sign pushed image references by digest (key-based). Reuses the runner's registry logins. | `images`, `digest`, `private-key`, `password` |
+| [`gitleaks-scan`](../.github/actions/gitleaks-scan/action.yml) | **Gitleaks** secret scan of the checked-out repo, scoped from the triggering event. Needs `fetch-depth: 0`. | `github-token`, `license` |
+| [`checkov-scan`](../.github/actions/checkov-scan/action.yml) | **Checkov** IaC misconfiguration lint (Dockerfile, Kubernetes, Terraform, …). Wraps a *container* action — gate it at **job** level, not step level. | `file` / `directory`, `framework`, `soft-fail` |
+| [`syft-sbom`](../.github/actions/syft-sbom/action.yml) | **Syft** SBOM of an image, directory or file, in CycloneDX by default. Outputs `bom-file` for `dependency-track-upload`. | `image` / `path` / `file`, `format`, `output-file`, `artifact-name` |
+| [`grype-scan`](../.github/actions/grype-scan/action.yml) | **Grype** CVE gate on an image, directory or SBOM. Keeps the report even when the gate trips. | `image` / `path` / `sbom`, `severity-cutoff`, `fail-build`, `artifact-name` |
 
 ### Reusable workflows (`.github/workflows/`)
 
@@ -144,13 +154,17 @@ Either way, the shared building blocks (`docker-build.yml`,
 
 ## Cross-repo consumption caveat
 
-The reusable workflows reference the composite actions with local paths
-(`uses: ./.github/actions/...`). This always works for in-repo callers. When
-consuming a reusable workflow **from another repository**, if you hit an
-"action not found" error for a nested composite action, it's because local
-paths resolve against the runner workspace — pin the caller to a catalog ref
-(`@develop` or a tag) and, if needed, add a `actions/checkout` of this catalog,
-or open an issue to switch that reference to a full `owner/repo/path@ref` form.
+The reusable workflows reference the composite actions by their **full**
+`owner/repo/path@ref` form
+(`uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/<name>@develop`),
+never as `./.github/actions/<name>`. A local `./` path resolves against the
+*caller's* checked-out workspace, not the catalog's, so it breaks the moment a
+reusable workflow is consumed from another repository. Keep the full form when
+you add an action reference, and bump the `@develop` refs together when the
+catalog moves to a tag.
+
+In your own jobs you can use either form: reference a catalog action with the
+full form above, or check the catalog out and use a local path.
 
 ## Detailed docs
 
