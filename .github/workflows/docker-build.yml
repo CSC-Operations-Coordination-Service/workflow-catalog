@@ -6,7 +6,7 @@ name: Docker build (reusable)
 # reads these repository secrets (dev/prod chosen via the `environment` input):
 #   NEXUS_DOCKER_REGISTRY_DEV / NEXUS_DOCKER_REGISTRY_PROD,
 #   NEXUS_USERNAME, NEXUS_PASSWORD,
-#   NEXUS_PYPI_INDEX_URL_DEV / NEXUS_PYPI_INDEX_URL_PROD (only when mount-pip-index: true),
+#   NEXUS_HOST, NEXUS_PORT (only when mount-pip-index: true),
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
 #   COSIGN_PRIVATE_KEY, COSIGN_PASSWORD (only when sign-image: true, release builds)
 
@@ -55,7 +55,13 @@ on:
         type: boolean
         default: false
       mount-pip-index:
-        description: "Mount the context's Nexus PyPI index as the `pip_index_url` build secret"
+        description: >
+          Mount the context's Nexus PyPI index as the `pip_index_url` build
+          secret, plus a matching `netrc` secret carrying the credentials.
+          Both are composed from NEXUS_HOST / NEXUS_PORT / NEXUS_USERNAME /
+          NEXUS_PASSWORD — the same secrets the nexus-context action uses on
+          the runner, so the index the image builds against cannot drift from
+          the one CI installs from.
         required: false
         type: boolean
         default: false
@@ -496,6 +502,64 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      # -----------------------------------------------------------------------
+      # Compose the pip build secrets, mirroring the nexus-context action:
+      # a credential-free index URL plus a separate ~/.netrc. Keeping the
+      # password out of the URL avoids percent-encoding it (an unescaped '@'
+      # or ':' silently mangles the netloc) and keeps it out of pip's logs,
+      # which print the index URL with only the password redacted.
+      # Written to files rather than `secrets:` inline values so the password
+      # never appears in a step's argument list.
+      # -----------------------------------------------------------------------
+      - name: Compose pip index secrets
+        if: inputs.mount-pip-index
+        env:
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          NEXUS_PORT: ${{ secrets.NEXUS_PORT }}
+          NEXUS_USER: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASSWORD }}
+          CTX: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$NEXUS_HOST" ]; then
+            echo "::error::mount-pip-index needs the NEXUS_HOST secret (bare hostname, no scheme/port)"
+            exit 1
+          fi
+          case "$NEXUS_HOST" in
+            *://*|*/*|*:*)
+              echo "::error::NEXUS_HOST must be a bare hostname — no scheme, port or path (got '$NEXUS_HOST')"
+              exit 1 ;;
+          esac
+          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASS" ]; then
+            echo "::error::mount-pip-index needs both NEXUS_USERNAME and NEXUS_PASSWORD"
+            exit 1
+          fi
+
+          # Empty port = scheme default; drop ':<port>' rather than emitting
+          # a dangling 'http://host:/path'.
+          if [ -n "$NEXUS_PORT" ]; then
+            case "$NEXUS_PORT" in
+              *[!0-9]*) echo "::error::NEXUS_PORT must be numeric (got '$NEXUS_PORT')"; exit 1 ;;
+            esac
+            authority="$NEXUS_HOST:$NEXUS_PORT"
+          else
+            authority="$NEXUS_HOST"
+          fi
+
+          # Same group repositories as pip.<ctx>.conf in the nexus-context action.
+          echo "http://$authority/repository/pypi-$CTX-group/simple" \
+            > "$RUNNER_TEMP/pip_index_url"
+
+          # pip matches netrc on the bare host: a 'machine host:port' entry is
+          # silently never found.
+          umask 077
+          printf 'machine %s\nlogin %s\npassword %s\n' \
+            "$NEXUS_HOST" "$NEXUS_USER" "$NEXUS_PASS" > "$RUNNER_TEMP/netrc"
+          chmod 600 "$RUNNER_TEMP/pip_index_url" "$RUNNER_TEMP/netrc"
+
+          echo "pip index: http://$authority/repository/pypi-$CTX-group/simple (netrc for '$NEXUS_HOST')"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
@@ -504,7 +568,11 @@ jobs:
           file: ${{ inputs.dockerfile }}
           push: true
           build-args: ${{ inputs.build-args }}
-          secrets: ${{ inputs.mount-pip-index && format('pip_index_url={0}', inputs.environment == 'prod' && secrets.NEXUS_PYPI_INDEX_URL_PROD || secrets.NEXUS_PYPI_INDEX_URL_DEV) || '' }}
+          # Blank lines are dropped by the action's list parser, so these
+          # collapse to nothing when mount-pip-index is false.
+          secret-files: |
+            ${{ inputs.mount-pip-index && format('pip_index_url={0}/pip_index_url', runner.temp) || '' }}
+            ${{ inputs.mount-pip-index && format('netrc={0}/netrc', runner.temp) || '' }}
           tags: ${{ steps.meta_dev.outputs.tags || steps.meta_release.outputs.tags }}
           labels: ${{ steps.meta_dev.outputs.labels || steps.meta_release.outputs.labels }}
 

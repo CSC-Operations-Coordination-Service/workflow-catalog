@@ -142,9 +142,9 @@ Either way, the shared building blocks (`docker-build.yml`,
 
   | Secret | Used by | For |
   | --- | --- | --- |
-  | `NEXUS_USERNAME`, `NEXUS_PASSWORD` | python-ci, docker-build | Nexus PyPI publish + Docker registry auth |
+  | `NEXUS_USERNAME`, `NEXUS_PASSWORD` | python-ci, docker-build | Nexus PyPI publish + Docker registry auth; also the `netrc` build secret under `mount-pip-index` |
+  | `NEXUS_HOST`, `NEXUS_PORT` | python-ci, docker-build (`mount-pip-index`) | pip index location, on the runner and inside image builds |
   | `NEXUS_DOCKER_REGISTRY_DEV`, `NEXUS_DOCKER_REGISTRY_PROD` | docker-build | Which Nexus Docker registry per context |
-  | `NEXUS_PYPI_INDEX_URL_DEV`, `NEXUS_PYPI_INDEX_URL_PROD` | docker-build (`mount-pip-index`) | pip index for registry-mode image builds |
   | `SONAR_TOKEN`, `SONAR_HOST_URL` | python-ci | SonarQube scan |
   | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` | sbom, docker-build, node-workflow | SBOM upload (`BOM_UPLOAD` + `PROJECT_CREATION_UPLOAD` + `VIEW_PORTFOLIO`) |
   | `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` | docker-build (`push-to-dockerhub`) | Docker Hub push |

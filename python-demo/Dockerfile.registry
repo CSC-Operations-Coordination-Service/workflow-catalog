@@ -3,8 +3,8 @@
 # Mode 2 — "registry": download the package that was published to the Nexus
 # PyPI repository and install it by version. No build context / wheel needed.
 #
-# The index URL (which may embed credentials) is passed as a BuildKit secret
-# so it is NOT baked into any image layer or `docker history`.
+# The index URL and the credentials are passed as two BuildKit secrets, so
+# neither is baked into an image layer or `docker history`.
 #
 FROM python:3.11-slim AS runtime
 
@@ -16,11 +16,20 @@ ARG PACKAGE_VERSION
 
 WORKDIR /app
 
-# `pip_index_url` secret = full Nexus PyPI simple index, e.g.
-#   https://user:pass@nexus.example.com/repository/pypi-group/simple
+# `pip_index_url` secret = Nexus PyPI simple index, credential-free, e.g.
+#   http://nexus.example.com:8081/repository/pypi-prod-group/simple
+# `netrc` secret carries the credentials, mounted where pip looks for them.
+# --no-input: without a TTY a 401 would otherwise end in an opaque EOFError
+# from pip's credential prompt instead of a readable auth error.
 RUN --mount=type=secret,id=pip_index_url \
-    pip install --no-cache-dir \
-        --index-url "$(cat /run/secrets/pip_index_url)" \
+    --mount=type=secret,id=netrc,target=/root/.netrc \
+    set -eu; \
+    index_url="$(tr -d '\r\n' < /run/secrets/pip_index_url)"; \
+    hostpart="${index_url#*://}"; hostpart="${hostpart%%/*}"; \
+    index_host="${hostpart##*@}"; index_host="${index_host%%:*}"; \
+    pip install --no-cache-dir --no-input \
+        --index-url "$index_url" \
+        --trusted-host "$index_host" \
         "python-demo==${PACKAGE_VERSION}"
 
 RUN useradd --create-home --uid 10001 appuser

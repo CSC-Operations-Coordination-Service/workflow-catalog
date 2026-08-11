@@ -54,17 +54,31 @@ placeholders while rendering those files into `$HOME`.
 ## Nexus — PyPI index for image builds (per context)
 
 Only consumed when a build sets `mount-pip-index: true` (the release/registry
-image build installs the published package by version). Passed to BuildKit as a
-secret so it never lands in an image layer.
+image build installs the published package by version). No dedicated secret is
+needed: `docker-build.yml` composes both BuildKit secrets from `NEXUS_HOST`,
+`NEXUS_PORT`, `NEXUS_USERNAME` and `NEXUS_PASSWORD` — the same four the
+`nexus-context` action uses for CI-job pulls, so the index an image builds
+against cannot drift from the one CI installs from.
 
-| Secret | Used by | Description |
+| BuildKit secret | Contents | Mounted at |
 | --- | --- | --- |
-| `NEXUS_PYPI_INDEX_URL_DEV` | `Dockerfile.registry` build (dev) | Full simple index URL **including credentials**, e.g. `http://user:pass@127.0.0.1:2375/repository/pypi-dev-group/simple`. |
-| `NEXUS_PYPI_INDEX_URL_PROD` | `Dockerfile.registry` build (prod) | Same for the prod group, e.g. `http://user:pass@127.0.0.1:2375/repository/pypi-prod-group/simple`. |
+| `pip_index_url` | Credential-free simple index, `http://$NEXUS_HOST:$NEXUS_PORT/repository/pypi-<ctx>-group/simple` | read from `/run/secrets/pip_index_url` |
+| `netrc` | `machine <host> / login / password` | `/root/.netrc` (0400, root) |
 
-> The committed `pip.*.conf` files are credential-free and used for the **CI
-> job** pulls (`PIP_CONFIG_FILE`). These index-URL secrets are a separate,
-> credential-bearing path used **inside the registry image build** only.
+> Credentials stay **out of the URL** deliberately. A password containing `@`,
+> `:`, `/` or `#` would need percent-encoding to survive as userinfo, and pip
+> redacts only the password when it echoes an index URL. The netrc split avoids
+> both problems, and mirrors how the runner already authenticates.
+>
+> **Retired:** `NEXUS_PYPI_INDEX_URL_DEV` / `NEXUS_PYPI_INDEX_URL_PROD`. They
+> are no longer read and can be deleted. A Dockerfile consuming
+> `mount-pip-index` must now mount the `netrc` secret:
+>
+> ```dockerfile
+> RUN --mount=type=secret,id=pip_index_url \
+>     --mount=type=secret,id=netrc,target=/root/.netrc \
+>     ...
+> ```
 
 ## Docker Hub (release only)
 
@@ -133,8 +147,6 @@ Consumed by [`gitleaks.yml`](workflows/gitleaks.yml). See
 - [ ] `NEXUS_PASSWORD`
 - [ ] `NEXUS_DOCKER_REGISTRY_DEV`
 - [ ] `NEXUS_DOCKER_REGISTRY_PROD`
-- [ ] `NEXUS_PYPI_INDEX_URL_DEV`
-- [ ] `NEXUS_PYPI_INDEX_URL_PROD`
 - [ ] `DOCKERHUB_USERNAME`
 - [ ] `DOCKERHUB_TOKEN`
 - [ ] `COSIGN_PRIVATE_KEY` (only when `sign-image: true`)
