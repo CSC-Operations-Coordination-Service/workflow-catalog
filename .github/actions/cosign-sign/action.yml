@@ -18,6 +18,15 @@ inputs:
   password:
     description: "Password that decrypts the Cosign private key"
     required: true
+  insecure-registries:
+    description: >
+      Whitespace-separated list of registries (bare host:port) served over plain
+      HTTP. Only references on those hosts are signed with
+      --allow-insecure-registry — Cosign resolves through go-containerregistry,
+      which defaults to HTTPS with no fallback, so a plain-HTTP Nexus connector
+      fails the signature otherwise. Empty = every reference is signed over TLS.
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -32,6 +41,7 @@ runs:
         COSIGN_PASSWORD: ${{ inputs.password }}
         DIGEST: ${{ inputs.digest }}
         IMAGES: ${{ inputs.images }}
+        INSECURE_REGISTRIES: ${{ inputs.insecure-registries }}
       run: |
         set -euo pipefail
 
@@ -42,8 +52,23 @@ runs:
 
         while IFS= read -r ref; do
           [ -n "$ref" ] || continue
-          echo "Signing ${ref}@${DIGEST}"
-          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${ref}@${DIGEST}"
+
+          # Decided per reference, not once for the whole run: a release signs
+          # the Nexus, GHCR and Docker Hub references from a single list, and
+          # --allow-insecure-registry applied globally would drag the two public
+          # registries onto plain HTTP as well. Unquoted on purpose — the input
+          # is a whitespace-separated list.
+          extra_args=()
+          for reg in $INSECURE_REGISTRIES; do
+            case "$ref" in
+              "$reg"/*)
+                extra_args+=(--allow-insecure-registry)
+                break ;;
+            esac
+          done
+
+          echo "Signing ${ref}@${DIGEST}${extra_args[0]+ (plain HTTP)}"
+          cosign sign --yes "${extra_args[@]}" --key env://COSIGN_PRIVATE_KEY "${ref}@${DIGEST}"
         done <<< "$IMAGES"
 
         echo "Cosign signing complete."

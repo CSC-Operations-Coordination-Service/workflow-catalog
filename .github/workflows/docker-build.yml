@@ -666,3 +666,7 @@ jobs:
           digest: ${{ steps.build.outputs.digest }}
           private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
           password: ${{ secrets.COSIGN_PASSWORD }}
+          # Same plain-HTTP connector BuildKit just pushed to. Named explicitly
+          # so only the Nexus reference is signed over HTTP; the GHCR and Docker
+          # Hub references in the same list keep TLS.
+          insecure-registries: ${{ inputs.insecure-registry && env.NEXUS_DOCKER_REGISTRY || '' }}
