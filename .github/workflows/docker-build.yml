@@ -6,7 +6,7 @@ name: Docker build (reusable)
 # reads these repository secrets (dev/prod chosen via the `environment` input):
 #   NEXUS_DOCKER_REGISTRY_DEV / NEXUS_DOCKER_REGISTRY_PROD,
 #   NEXUS_USERNAME, NEXUS_PASSWORD,
-#   NEXUS_HOST, NEXUS_PORT (only when mount-pip-index: true),
+#   NEXUS_HOST, NEXUS_PORT (only when mount-pip-index / mount-npm-registry: true),
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
 #   COSIGN_PRIVATE_KEY, COSIGN_PASSWORD (only when sign-image: true, release builds)
 
@@ -65,6 +65,30 @@ on:
         required: false
         type: boolean
         default: false
+      mount-npm-registry:
+        description: >
+          Mount a Nexus npm registry as the `npmrc` build secret, for images
+          whose build runs `npm ci` / `npm install`. The npm counterpart of
+          mount-pip-index, and needed for the same reason: BuildKit resolves
+          `FROM` with its own egress (proxy or mirror), but a RUN step inherits
+          none of that, so on a runner without direct internet a package install
+          fails inside the build even though the base image pulled fine.
+          Composed from NEXUS_HOST / NEXUS_PORT and, when both are set,
+          NEXUS_USERNAME / NEXUS_PASSWORD.
+        required: false
+        type: boolean
+        default: false
+      npm-registry-repo:
+        description: >
+          Nexus repository name serving npm packages, e.g. a proxy of
+          registry.npmjs.org or a group that includes one. Only read when
+          mount-npm-registry is true. Deliberately an input rather than the
+          derived `npm-<context>-group` the PyPI side uses: npm repositories here
+          are not split per context. Pass a different name (or an expression on
+          `environment`) if yours are.
+        required: false
+        type: string
+        default: "npm-proxy"
       insecure-registry:
         description: "Nexus serves the Docker connector over plain HTTP — tell BuildKit to push over HTTP instead of TLS"
         required: false
@@ -467,16 +491,22 @@ jobs:
 
       - name: Compose image list
         id: images
+        # Lowercased: OCI repository names must be lowercase. metadata-action
+        # lowercases on its own, so the push works either way, but Cosign and
+        # the scanners take this list verbatim and reject a mixed-case owner
+        # (e.g. ghcr.io/CSC-Operations-Coordination-Service/...).
         run: |
           {
             echo "list<<EOF"
-            echo "${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}"
-            if [ "${{ inputs.push-to-ghcr }}" = "true" ]; then
-              echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
-            fi
-            if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
-              echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
-            fi
+            {
+              echo "${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}"
+              if [ "${{ inputs.push-to-ghcr }}" = "true" ]; then
+                echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
+              fi
+              if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
+                echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
+              fi
+            } | tr '[:upper:]' '[:lower:]'
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -560,6 +590,84 @@ jobs:
 
           echo "pip index: http://$authority/repository/pypi-$CTX-group/simple (netrc for '$NEXUS_HOST')"
 
+      # -----------------------------------------------------------------------
+      # Compose the npm build secret — the counterpart of the pip step above,
+      # for images whose build runs `npm ci`. One file: an .npmrc naming the
+      # Nexus registry, plus a scoped `_auth` line when credentials are
+      # available. Written to a file rather than an inline `secrets:` value so
+      # the credential never appears in a step's argument list.
+      #
+      # Credentials are OPTIONAL here, unlike the pip step: a Nexus npm proxy is
+      # commonly readable anonymously, and requiring them would block that setup
+      # for no reason. When both are present the auth line is added, and the
+      # base64 blob is masked — GitHub masks the raw secrets, but not a
+      # re-encoding of them, so it would otherwise be one `cat` away from the log.
+      # -----------------------------------------------------------------------
+      - name: Compose npm registry secret
+        if: inputs.mount-npm-registry
+        env:
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          NEXUS_PORT: ${{ secrets.NEXUS_PORT }}
+          NEXUS_USER: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASS: ${{ secrets.NEXUS_PASSWORD }}
+          NPM_REPO: ${{ inputs.npm-registry-repo }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$NEXUS_HOST" ]; then
+            echo "::error::mount-npm-registry needs the NEXUS_HOST secret (bare hostname, no scheme/port)"
+            exit 1
+          fi
+          case "$NEXUS_HOST" in
+            *://*|*/*|*:*)
+              echo "::error::NEXUS_HOST must be a bare hostname — no scheme, port or path (got '$NEXUS_HOST')"
+              exit 1 ;;
+          esac
+
+          # A repo name carrying a scheme or a path silently produces a registry
+          # URL npm cannot use, and npm's error names only the package it failed
+          # to fetch — not the malformed registry.
+          if [ -z "$NPM_REPO" ]; then
+            echo "::error::npm-registry-repo is empty — set it to the Nexus npm repository name, e.g. npm-proxy"
+            exit 1
+          fi
+          case "$NPM_REPO" in
+            *://*|*/*)
+              echo "::error::npm-registry-repo must be a bare repository name — no scheme, no path (got '$NPM_REPO')"
+              exit 1 ;;
+          esac
+
+          # Empty port = scheme default; drop ':<port>' rather than emitting
+          # a dangling 'http://host:/path'.
+          if [ -n "$NEXUS_PORT" ]; then
+            case "$NEXUS_PORT" in
+              *[!0-9]*) echo "::error::NEXUS_PORT must be numeric (got '$NEXUS_PORT')"; exit 1 ;;
+            esac
+            authority="$NEXUS_HOST:$NEXUS_PORT"
+          else
+            authority="$NEXUS_HOST"
+          fi
+
+          # npm requires the trailing slash: the auth key below is matched against
+          # the registry URL by prefix, and without it the two never line up.
+          registry="http://$authority/repository/$NPM_REPO/"
+
+          umask 077
+          echo "registry=$registry" > "$RUNNER_TEMP/npmrc"
+
+          if [ -n "$NEXUS_USER" ] && [ -n "$NEXUS_PASS" ]; then
+            auth=$(printf '%s:%s' "$NEXUS_USER" "$NEXUS_PASS" | base64 | tr -d '\n')
+            echo "::add-mask::$auth"
+            # The auth key is the registry URL with the scheme stripped.
+            printf '//%s/repository/%s/:_auth=%s\n' "$authority" "$NPM_REPO" "$auth" \
+              >> "$RUNNER_TEMP/npmrc"
+            echo "npm registry: $registry (authenticated as '$NEXUS_USER')"
+          else
+            echo "npm registry: $registry (anonymous — NEXUS_USERNAME/NEXUS_PASSWORD not both set)"
+          fi
+
+          chmod 600 "$RUNNER_TEMP/npmrc"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
@@ -568,11 +676,12 @@ jobs:
           file: ${{ inputs.dockerfile }}
           push: true
           build-args: ${{ inputs.build-args }}
-          # Blank lines are dropped by the action's list parser, so these
-          # collapse to nothing when mount-pip-index is false.
+          # Blank lines are dropped by the action's list parser, so each of these
+          # collapses to nothing when its mount-* input is false.
           secret-files: |
             ${{ inputs.mount-pip-index && format('pip_index_url={0}/pip_index_url', runner.temp) || '' }}
             ${{ inputs.mount-pip-index && format('netrc={0}/netrc', runner.temp) || '' }}
+            ${{ inputs.mount-npm-registry && format('npmrc={0}/npmrc', runner.temp) || '' }}
           tags: ${{ steps.meta_dev.outputs.tags || steps.meta_release.outputs.tags }}
           labels: ${{ steps.meta_dev.outputs.labels || steps.meta_release.outputs.labels }}
 

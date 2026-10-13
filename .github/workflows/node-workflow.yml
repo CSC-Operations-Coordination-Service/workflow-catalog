@@ -4,11 +4,13 @@ name: Node CI (reusable)
 # Python pipeline. Callers reference it with `uses:` and supply everything
 # project-specific via inputs. Pass secrets with `secrets: inherit`.
 #
-# Pipeline: install -> lint -> build -> test -> (optional npm SBOM -> Dependency-Track)
+# Pipeline: (optional Nexus registry setup) -> install -> lint -> build -> test
+#           -> (optional npm SBOM -> Dependency-Track)
 #           -> (optional Docker image via docker-build.yml).
 #
 # Secrets consumed (only when the matching feature is enabled; provided via
 # `secrets: inherit` from the caller):
+#   NEXUS_HOST / NEXUS_PORT / NEXUS_USERNAME / NEXUS_PASSWORD (use-nexus-registry)
 #   DEPENDENCYTRACK_URL / DEPENDENCYTRACK_API_KEY   (generate-sbom)
 #   NEXUS_DOCKER_REGISTRY_DEV / _PROD, NEXUS_USERNAME, NEXUS_PASSWORD,
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN             (build-image)
@@ -32,6 +34,27 @@ on:
         default: "self-hosted"
 
       # --- pipeline steps (each individually toggleable) ------------------
+      use-nexus-registry:
+        description: >
+          Install from the organization's Nexus npm registry instead of
+          registry.npmjs.org — the Node counterpart of what nexus-context does
+          for pip, using the same NEXUS_* secrets. Covers both halves of the
+          pipeline: the npm-context action configures the install below, and
+          `mount-npm-registry` is forwarded to the image build so a Dockerfile
+          running `npm ci` resolves through Nexus too.
+
+          Required on runners without direct internet egress, and worth enabling
+          anyway so what CI installs cannot drift from what the image installs.
+        required: false
+        type: boolean
+        default: false
+      npm-registry-repo:
+        description: >
+          Nexus repository serving npm packages when use-nexus-registry is true —
+          a proxy of registry.npmjs.org, or a group that includes one.
+        required: false
+        type: string
+        default: "npm-proxy"
       install-command:
         description: "Dependency install command"
         required: false
@@ -151,14 +174,42 @@ jobs:
           restore-keys: |
             npm-${{ inputs.working-directory }}-
 
+      # Writes ~/.npmrc and exports NPM_CONFIG_USERCONFIG, so every npm step
+      # below resolves through Nexus. Before the install, and after the cache
+      # restore — the cache holds tarballs, not registry configuration.
+      - name: Set up Nexus npm registry
+        if: inputs.use-nexus-registry
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/npm-context@develop
+        with:
+          registry-repo: ${{ inputs.npm-registry-repo }}
+          nexus-host: ${{ secrets.NEXUS_HOST }}
+          nexus-port: ${{ secrets.NEXUS_PORT }}
+          nexus-username: ${{ secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+
       - name: Install dependencies
         run: ${{ inputs.install-command }}
 
       - name: Export build env
         if: inputs.build-env != ''
+        # Two things this step got wrong before, both silent until they were not:
+        #
+        # 1. `[ -n "$line" ] && echo ...` made the failed test the exit status of
+        #    the last loop iteration, hence of the pipeline. A block scalar ends
+        #    with a newline and printf adds another, so the final iteration always
+        #    read an empty line and the step failed with exit 1 under
+        #    `bash -eo pipefail` — after correctly writing every variable. Any
+        #    non-empty build-env tripped it, which made the input unusable.
+        # 2. Interpolating the input into the script body let a value containing
+        #    a quote or a backtick break the script. It arrives as an env var now,
+        #    so the shell never parses it as code.
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
         run: |
-          printf '%s\n' "${{ inputs.build-env }}" | while IFS= read -r line; do
-            [ -n "$line" ] && echo "$line" >> "$GITHUB_ENV"
+          printf '%s\n' "$BUILD_ENV" | while IFS= read -r line; do
+            if [ -n "$line" ]; then
+              echo "$line" >> "$GITHUB_ENV"
+            fi
           done
         working-directory: ${{ github.workspace }}
 
@@ -256,6 +307,10 @@ jobs:
       push-to-ghcr: ${{ inputs.push-to-ghcr }}
       push-to-dockerhub: ${{ inputs.push-to-dockerhub }}
       environment: ${{ inputs.docker-environment }}
+      # Same toggle drives both halves: an image that runs `npm ci` needs the
+      # registry as much as the job above does.
+      mount-npm-registry: ${{ inputs.use-nexus-registry }}
+      npm-registry-repo: ${{ inputs.npm-registry-repo }}
       generate-sbom: ${{ inputs.generate-sbom }}
       sbom-project-name: ${{ inputs.image-name != '' && format('{0}-image', inputs.image-name) || '' }}
       sbom-project-version: ${{ inputs.sbom-project-version }}

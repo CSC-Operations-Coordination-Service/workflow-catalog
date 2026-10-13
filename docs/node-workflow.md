@@ -13,8 +13,9 @@ the same building blocks — see the [catalog overview](README.md).
 ## Pipeline
 
 ```
-install → lint → build → test → (optional npm SBOM → Dependency-Track)
-                                 → (optional Docker image via docker-build.yml)
+(optional Nexus registry) → install → lint → build → test
+                          → (optional npm SBOM → Dependency-Track)
+                          → (optional Docker image via docker-build.yml)
 ```
 
 Each step is individually toggleable via inputs; the image build reuses the same
@@ -57,6 +58,8 @@ jobs:
 | `working-directory` (required) | — | Directory containing `package.json` |
 | `node-version` | `22` | Node major / `node:<v>` container tag |
 | `runs-on` | `self-hosted` | Runner label |
+| `use-nexus-registry` | `false` | Install from the organization's Nexus npm registry instead of registry.npmjs.org. Also forwarded to the image build as `mount-npm-registry` |
+| `npm-registry-repo` | `npm-proxy` | Nexus repository serving npm packages (a proxy of registry.npmjs.org, or a group including one) |
 | `install-command` | `npm ci` | Dependency install |
 | `run-lint` / `lint-command` | `true` / `npm run lint` | Lint step |
 | `run-build` / `build-command` | `true` / `npm run build` | Build step |
@@ -68,8 +71,35 @@ jobs:
 | `image-name`, `dockerfile`, `docker-context`, `docker-build-args` | — | Image build params |
 | `docker-release`, `push-to-ghcr`, `push-to-dockerhub`, `docker-environment` | `false`/`false`/`false`/`dev` | Registry/tagging behaviour |
 
+## Installing through Nexus
+
+`use-nexus-registry: true` routes npm at the organization's Nexus registry — the
+same idea as `nexus-context` on the Python side, reading the same organization
+secrets, so nothing about the registry is committed to a consuming repo.
+
+It covers **both** halves of the pipeline from one toggle:
+
+- the [`npm-context`](../.github/actions/npm-context/action.yml) action configures
+  the `install-command` step on the runner;
+- `mount-npm-registry` is forwarded to `docker-build.yml`, so a Dockerfile running
+  `npm ci` resolves through Nexus too — provided it mounts the secret:
+
+  ```dockerfile
+  RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+  ```
+
+This is required on runners without direct internet egress, where a `RUN` step
+inherits neither BuildKit's mirror nor its proxy — see
+[docker-build-network.md](docker-build-network.md), hop 3. It is worth enabling
+regardless, so what CI installs cannot drift from what the image installs.
+
+Credentials are optional: a Nexus npm proxy is commonly readable anonymously, and
+the auth line is written only when `NEXUS_USERNAME` and `NEXUS_PASSWORD` are both
+set. The step logs which mode it used.
+
 ## Secrets
 
 Provide with `secrets: inherit`. Consumed only when the matching feature is enabled:
+`NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` (`use-nexus-registry`);
 `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` (SBOM); `NEXUS_DOCKER_REGISTRY_DEV/_PROD`,
 `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (image).

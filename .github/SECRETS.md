@@ -28,15 +28,15 @@ placeholders while rendering those files into `$HOME`.
 
 | Secret | Used by | Description |
 | --- | --- | --- |
-| `NEXUS_HOST` | `nexus-context` (pip + twine config) | Bare hostname — **no scheme, no port, no path**, e.g. `oep-sysma-mondb-02.ocs.local`. Also becomes the `machine` entry in the generated `~/.netrc`. |
-| `NEXUS_PORT` | `nexus-context` (pip + twine config) | Port only, e.g. `8081`. Leave unset for the scheme default (80/443) — the `:<port>` is then dropped from the URL. |
+| `NEXUS_HOST` | `nexus-context` (pip + twine), `npm-context` (npm) | Bare hostname — **no scheme, no port, no path**, e.g. `oep-sysma-mondb-02.ocs.local`. Also becomes the `machine` entry in the generated `~/.netrc`. |
+| `NEXUS_PORT` | `nexus-context` (pip + twine), `npm-context` (npm) | Port only, e.g. `8081`. Leave unset for the scheme default (80/443) — the `:<port>` is then dropped from the URL. |
 
 ## Nexus — shared credentials
 
 | Secret | Used by | Description |
 | --- | --- | --- |
-| `NEXUS_USERNAME` | pip (`~/.netrc`), twine publish, Docker login | Nexus account username (same for dev & prod). |
-| `NEXUS_PASSWORD` | pip (`~/.netrc`), twine publish, Docker login | Nexus account password / token. |
+| `NEXUS_USERNAME` | pip (`~/.netrc`), npm (`~/.npmrc`), twine publish, Docker login | Nexus account username (same for dev & prod). |
+| `NEXUS_PASSWORD` | pip (`~/.netrc`), npm (`~/.npmrc`), twine publish, Docker login | Nexus account password / token. |
 
 > pip has no username/password environment variables, so index **reads** are
 > authenticated with a `~/.netrc` that `nexus-context` generates at runtime
@@ -51,11 +51,15 @@ placeholders while rendering those files into `$HOME`.
 | `NEXUS_DOCKER_REGISTRY_DEV` | `docker-local` (develop) | Dev Docker registry `host:port` to push to, e.g. `127.0.0.1:8082`. No scheme, no image path. |
 | `NEXUS_DOCKER_REGISTRY_PROD` | `docker-registry` (release tags) | Prod Docker registry `host:port`, e.g. `127.0.0.1:8084`. |
 
-## Nexus — PyPI index for image builds (per context)
+## Nexus — package registries for image builds
 
-Only consumed when a build sets `mount-pip-index: true` (the release/registry
-image build installs the published package by version). No dedicated secret is
-needed: `docker-build.yml` composes both BuildKit secrets from `NEXUS_HOST`,
+Consumed when a build sets `mount-pip-index: true` or `mount-npm-registry: true`.
+A `RUN` step inherits neither BuildKit's mirror nor its proxy, so on a runner
+without direct egress this is what lets `pip install` / `npm ci` resolve at all —
+see [docker-build-network.md](../docs/docker-build-network.md), hop 3.
+
+No dedicated secret is needed: `docker-build.yml` composes the BuildKit secrets
+from `NEXUS_HOST`,
 `NEXUS_PORT`, `NEXUS_USERNAME` and `NEXUS_PASSWORD` — the same four the
 `nexus-context` action uses for CI-job pulls, so the index an image builds
 against cannot drift from the one CI installs from.
@@ -64,6 +68,7 @@ against cannot drift from the one CI installs from.
 | --- | --- | --- |
 | `pip_index_url` | Credential-free simple index, `http://$NEXUS_HOST:$NEXUS_PORT/repository/pypi-<ctx>-group/simple` | read from `/run/secrets/pip_index_url` |
 | `netrc` | `machine <host> / login / password` | `/root/.netrc` (0400, root) |
+| `npmrc` | A complete `.npmrc`: `registry=…/repository/<npm-registry-repo>/` plus a scoped `_auth` line when credentials are set | `/root/.npmrc` |
 
 > Credentials stay **out of the URL** deliberately. A password containing `@`,
 > `:`, `/` or `#` would need percent-encoding to survive as userinfo, and pip
@@ -79,6 +84,25 @@ against cannot drift from the one CI installs from.
 >     --mount=type=secret,id=netrc,target=/root/.netrc \
 >     ...
 > ```
+
+The npm secret differs from the pip pair in three ways:
+
+- **The repository is named, not derived.** `npm-registry-repo` (default
+  `npm-proxy`) selects it. PyPI derives `pypi-<ctx>-group` from `environment`;
+  npm repositories are not split per context here.
+- **Credentials are optional.** A Nexus npm proxy is commonly readable
+  anonymously, so the `_auth` line is written only when `NEXUS_USERNAME` and
+  `NEXUS_PASSWORD` are both set. The step's log line says which mode it used.
+- **It is mounted where npm already looks**, so the Dockerfile needs no flags:
+>
+> ```dockerfile
+> RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+> ```
+
+`_auth` is base64 of `user:password` — same motivation as the `netrc` split above,
+a password containing `@`, `:` or `/` needs no escaping. That encoding is masked
+explicitly in the log, since GitHub masks the raw secrets but not a re-encoding
+of them.
 
 ## Docker Hub (release only)
 
