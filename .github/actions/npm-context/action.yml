@@ -1,0 +1,139 @@
+name: "npm Nexus context setup"
+description: >
+  Point npm at a Nexus registry for the rest of the job.
+
+  The Node counterpart of the nexus-context action, fed by the same
+  organization-level Nexus secrets, so a Node job installs from the same server
+  a Python job does. Writes an ~/.npmrc holding the registry and, when
+  credentials are supplied, a scoped `_auth` line, then exports
+  NPM_CONFIG_USERCONFIG so every later step resolves it regardless of cwd.
+
+  Nothing about the registry is committed to the consuming repo: the host and
+  port come from secrets, and the repository name is an input.
+
+inputs:
+  registry-repo:
+    description: >
+      Nexus repository serving npm packages — a proxy of registry.npmjs.org, or
+      a group that includes one. Bare repository name, no scheme and no path.
+
+      Deliberately not derived from a dev/prod context the way the PyPI side
+      builds 'pypi-<context>-group': npm repositories are typically not split
+      per context. Pass a different name (or an expression) if yours are.
+    required: false
+    default: "npm-proxy"
+  nexus-host:
+    description: >
+      Nexus hostname, no scheme and no port — pass the NEXUS_HOST secret.
+      Example: nexus.example.com
+    required: true
+  nexus-port:
+    description: >
+      Nexus port — pass the NEXUS_PORT secret. Leave empty for the scheme
+      default (80/443), in which case ':<port>' is dropped from the URL.
+    required: false
+    default: ""
+  nexus-username:
+    description: >
+      Nexus user — pass the NEXUS_USERNAME secret. Leave empty if the registry
+      allows anonymous read; no auth line is written in that case.
+    required: false
+    default: ""
+  nexus-password:
+    description: "Nexus password/token — pass the NEXUS_PASSWORD secret."
+    required: false
+    default: ""
+
+outputs:
+  registry:
+    description: "The resolved registry URL, for logging or a later step"
+    value: ${{ steps.render.outputs.registry }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Render ~/.npmrc for the Nexus registry
+      id: render
+      shell: bash
+      env:
+        NPM_REPO: ${{ inputs.registry-repo }}
+        NEXUS_HOST: ${{ inputs.nexus-host }}
+        NEXUS_PORT: ${{ inputs.nexus-port }}
+        NEXUS_USER: ${{ inputs.nexus-username }}
+        NEXUS_PASS: ${{ inputs.nexus-password }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$NEXUS_HOST" ]; then
+          echo "::error::npm-context: 'nexus-host' is required (set the NEXUS_HOST secret)"
+          exit 1
+        fi
+        case "$NEXUS_HOST" in
+          *://*|*/*|*:*)
+            echo "::error::npm-context: 'nexus-host' must be a bare hostname — no scheme, port or path (got '$NEXUS_HOST')"
+            exit 1 ;;
+        esac
+        if [ -z "$NPM_REPO" ]; then
+          echo "::error::npm-context: 'registry-repo' is required, e.g. npm-proxy"
+          exit 1
+        fi
+        # A repo name carrying a scheme or a path yields a registry URL npm
+        # cannot use, and npm's error then names only the package it failed to
+        # fetch — never the malformed registry.
+        case "$NPM_REPO" in
+          *://*|*/*)
+            echo "::error::npm-context: 'registry-repo' must be a bare repository name — no scheme, no path (got '$NPM_REPO')"
+            exit 1 ;;
+        esac
+        # Checked before anything is written: a half-written .npmrc naming the
+        # registry but carrying no auth line would otherwise be left behind, and
+        # a later step would fail with a 401 that says nothing about the cause.
+        if { [ -n "$NEXUS_USER" ] && [ -z "$NEXUS_PASS" ]; } \
+          || { [ -z "$NEXUS_USER" ] && [ -n "$NEXUS_PASS" ]; }; then
+          echo "::error::npm-context: set both 'nexus-username' and 'nexus-password', or neither"
+          exit 1
+        fi
+        if [ -n "$NEXUS_PORT" ]; then
+          case "$NEXUS_PORT" in
+            *[!0-9]*)
+              echo "::error::npm-context: 'nexus-port' must be numeric (got '$NEXUS_PORT')"
+              exit 1 ;;
+          esac
+          authority="$NEXUS_HOST:$NEXUS_PORT"
+        else
+          # No port = scheme default; drop ':<port>' rather than emitting a
+          # dangling 'http://host:/path'.
+          authority="$NEXUS_HOST"
+        fi
+
+        # The trailing slash is required: npm matches the auth key below against
+        # the registry URL by prefix, and without it the two never line up.
+        registry="http://$authority/repository/$NPM_REPO/"
+
+        umask 077
+        echo "registry=$registry" > "$HOME/.npmrc"
+
+        if [ -n "$NEXUS_USER" ]; then
+          # base64 of user:password, so a password containing '@', ':' or '/'
+          # needs no escaping — the same reasoning as the .netrc that
+          # nexus-context writes for pip.
+          auth=$(printf '%s:%s' "$NEXUS_USER" "$NEXUS_PASS" | base64 | tr -d '\n')
+          # GitHub masks the raw secrets but not a re-encoding of them, so this
+          # value would otherwise be one `npm config list` away from the log.
+          echo "::add-mask::$auth"
+          printf '//%s/repository/%s/:_auth=%s\n' "$authority" "$NPM_REPO" "$auth" \
+            >> "$HOME/.npmrc"
+          mode="authenticated as '$NEXUS_USER'"
+        else
+          mode="anonymous"
+        fi
+
+        chmod 600 "$HOME/.npmrc"
+
+        # npm reads $HOME/.npmrc as the user config by default, but $HOME is not
+        # always what a job container reports; naming the file outright removes
+        # the ambiguity for every later step.
+        echo "NPM_CONFIG_USERCONFIG=$HOME/.npmrc" >> "$GITHUB_ENV"
+        echo "registry=$registry" >> "$GITHUB_OUTPUT"
+
+        echo "npm registry: $registry ($mode)"
