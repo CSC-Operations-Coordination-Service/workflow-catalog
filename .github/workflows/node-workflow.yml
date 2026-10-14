@@ -297,7 +297,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/npm-registry
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: ${{ inputs.image-name }}
       context: ${{ inputs.docker-context }}
