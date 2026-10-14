@@ -20,7 +20,7 @@ callers (triggers)          python-demo.yml          <your-app>.yml (in your rep
 reusable workflows  python-ci.yml  sbom.yml  docker-build.yml  gitleaks.yml  node-workflow.yml
 (jobs)                     │           │            │              │              │
         │  uses:           ▼           ▼            ▼              ▼              ▼
-composite actions      nexus-context   dependency-track-upload   cosign-sign
+composite actions      nexus-context   npm-context   dependency-track-upload   cosign-sign
 (steps)                gitleaks-scan   checkov-scan   syft-sbom   grype-scan
 ```
 
@@ -42,6 +42,7 @@ workflow.
 | Action | Purpose | Key inputs |
 | --- | --- | --- |
 | [`nexus-context`](../.github/actions/nexus-context/action.yml) | Configure pip + twine for a Nexus `dev`/`prod` context (writes `pip.conf` / `.pypirc`, exports `PIP_CONFIG_FILE` + `TWINE_REPOSITORY`). | `context` (dev/prod), `config-dir` |
+| [`npm-context`](../.github/actions/npm-context/action.yml) | Point npm at a Nexus registry for the rest of the job (writes `~/.npmrc`, exports `NPM_CONFIG_USERCONFIG`). The Node counterpart of `nexus-context`, on the same secrets. | `registry-repo`, `nexus-host`, `nexus-port`, `nexus-username`, `nexus-password` |
 | [`dependency-track-upload`](../.github/actions/dependency-track-upload/action.yml) | Upload a CycloneDX SBOM to Dependency-Track (`POST /api/v1/bom`). Language/tool-agnostic. | `bom-file`, `project-name`, `project-version`, `server-url`, `api-key` |
 | [`cosign-sign`](../.github/actions/cosign-sign/action.yml) | Install Cosign and sign pushed image references by digest (key-based). Reuses the runner's registry logins. | `images`, `digest`, `private-key`, `password` |
 | [`gitleaks-scan`](../.github/actions/gitleaks-scan/action.yml) | **Gitleaks** secret scan of the checked-out repo, scoped from the triggering event. Needs `fetch-depth: 0`. | `github-token`, `license` |
@@ -55,9 +56,9 @@ workflow.
 | --- | --- | --- |
 | [`python-ci.yml`](../.github/workflows/python-ci.yml) | primitive | Python **test → build → publish** to Nexus. Outputs `version`. |
 | [`sbom.yml`](../.github/workflows/sbom.yml) | primitive | Package **CycloneDX SBOM → Dependency-Track** (consumes the `dist` artifact). |
-| [`docker-build.yml`](../.github/workflows/docker-build.yml) | primitive | Language-agnostic **image build + push** (Nexus / GHCR / Docker Hub) with optional image SBOM → Dependency-Track, optional **Checkov** Dockerfile lint (`scan-dockerfile`), **Grype** CVE gate (`scan-image`), **Dockle** image-hardening lint (`lint-image`), and **Cosign** image signing (`sign-image`, release builds). |
+| [`docker-build.yml`](../.github/workflows/docker-build.yml) | primitive | Language-agnostic **image build + push** (Nexus / GHCR / Docker Hub) with optional image SBOM → Dependency-Track, optional **Checkov** Dockerfile lint (`scan-dockerfile`), **Grype** CVE gate (`scan-image`), **Dockle** image-hardening lint (`lint-image`), and **Cosign** image signing (`sign-image`, release builds). Builds that install packages in a `RUN` step route them through Nexus with `mount-pip-index` / `mount-npm-registry`. |
 | [`gitleaks.yml`](../.github/workflows/gitleaks.yml) | primitive | **Secret scanning** with Gitleaks. Dual-triggered: `workflow_call` (reusable) **and** `push`/`pull_request` (guards this repo). |
-| [`node-workflow.yml`](../.github/workflows/node-workflow.yml) | all-in-one | Node/React **install → lint → build → test**, with optional npm SBOM and image build via toggles. |
+| [`node-workflow.yml`](../.github/workflows/node-workflow.yml) | all-in-one | Node/React **install → lint → build → test**, with optional Nexus registry (`use-nexus-registry`), npm SBOM and image build via toggles. |
 
 ### Callers
 

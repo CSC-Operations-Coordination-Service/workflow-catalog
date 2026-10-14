@@ -19,6 +19,7 @@ full building-block reference, composition styles, use cases, and conventions.
 | [`gitleaks.yml`](.github/workflows/gitleaks.yml) | reusable workflow | Secret scanning (Gitleaks) — reusable + self-triggering |
 | [`node-workflow.yml`](.github/workflows/node-workflow.yml) | reusable workflow | Node/React CI (all-in-one, toggleable) |
 | [`nexus-context`](.github/actions/nexus-context/action.yml) | composite action | pip/twine config for a Nexus dev/prod context |
+| [`npm-context`](.github/actions/npm-context/action.yml) | composite action | npm config for a Nexus registry (the Node counterpart) |
 | [`dependency-track-upload`](.github/actions/dependency-track-upload/action.yml) | composite action | Upload a CycloneDX SBOM to Dependency-Track |
 | [`gitleaks-scan`](.github/actions/gitleaks-scan/action.yml) | composite action | Gitleaks secret scan of the checked-out repo |
 | [`checkov-scan`](.github/actions/checkov-scan/action.yml) | composite action | Checkov IaC misconfiguration lint (Dockerfile, K8s, Terraform, …) |
