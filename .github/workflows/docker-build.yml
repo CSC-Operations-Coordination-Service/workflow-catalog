@@ -195,6 +195,35 @@ on:
         type: boolean
         default: false
 
+      runs-on:
+        description: "Runner label of every job (e.g. containerized for the container runner pool)"
+        required: false
+        type: string
+        default: self-hosted
+
+      # --- secrets source -------------------------------------------------
+      secrets-source:
+        description: >
+          Where the Nexus, Docker Hub, Dependency-Track and Cosign values come
+          from. `github` (default): the repository/organization secrets, as
+          before. `openbao`: read them from OpenBao with the job's OIDC token
+          (JWT auth), for private repositories that cannot use organization
+          secrets. `openbao` needs `permissions: id-token: write` on the calling
+          job, and the containerized runner pool (runs-on: containerized).
+        required: false
+        type: string
+        default: github
+      openbao-url:
+        description: "OpenBao API URL (secrets-source: openbao)"
+        required: false
+        type: string
+        default: "https://openbao:8200"
+      openbao-role:
+        description: "OpenBao JWT role of this repository, e.g. ci-ocs-operator-app (secrets-source: openbao)"
+        required: false
+        type: string
+        default: ""
+
 jobs:
   # ---------------------------------------------------------------------------
   # Dockerfile IaC lint — Checkov checks the Dockerfile for security
@@ -212,7 +241,7 @@ jobs:
   # ---------------------------------------------------------------------------
   dockerfile-lint:
     if: inputs.scan-dockerfile
-    runs-on: self-hosted
+    runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: read
 
@@ -243,13 +272,58 @@ jobs:
       ${{ !cancelled()
           && (inputs.scan-dockerfile-soft-fail
               || needs.dockerfile-lint.result != 'failure') }}
-    runs-on: self-hosted
-    permissions:
-      contents: read
-      packages: write # required to push to GHCR
+    runs-on: ${{ inputs.runs-on }}
+    # No `permissions:` block on purpose, see node-workflow.yml `docker`: the job
+    # takes what the caller grants (contents: read and packages: write to push
+    # to GHCR, plus id-token: write in openbao mode) instead of failing every
+    # caller that does not grant id-token.
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Read secrets from OpenBao
+        if: inputs.secrets-source == 'openbao'
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          shared: |
+            NEXUS_HOST
+            NEXUS_PORT
+            NEXUS_USERNAME
+            NEXUS_PASSWORD
+            NEXUS_DOCKER_REGISTRY_DEV
+            NEXUS_DOCKER_REGISTRY_PROD
+
+      - name: Read Docker Hub secrets from OpenBao
+        if: inputs.secrets-source == 'openbao' && inputs.push-to-dockerhub
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          shared: |
+            DOCKERHUB_USERNAME
+            DOCKERHUB_TOKEN
+
+      - name: Read Dependency-Track secrets from OpenBao
+        if: inputs.secrets-source == 'openbao' && inputs.generate-sbom
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          shared: |
+            DEPENDENCYTRACK_URL
+            DEPENDENCYTRACK_API_KEY
+
+      - name: Read Cosign secrets from OpenBao
+        if: inputs.secrets-source == 'openbao' && inputs.sign-image
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          shared: |
+            COSIGN_PRIVATE_KEY
+            COSIGN_PASSWORD
 
       - name: Download artifact
         if: inputs.artifact-name != ''
@@ -270,8 +344,8 @@ jobs:
         # usual copy-paste damage and fail here, naming the offending secret,
         # instead of several steps later on an unreadable error.
         env:
-          RAW_DEV: ${{ secrets.NEXUS_DOCKER_REGISTRY_DEV }}
-          RAW_PROD: ${{ secrets.NEXUS_DOCKER_REGISTRY_PROD }}
+          RAW_DEV: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_DEV || secrets.NEXUS_DOCKER_REGISTRY_DEV }}
+          RAW_PROD: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_PROD || secrets.NEXUS_DOCKER_REGISTRY_PROD }}
           ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
@@ -459,8 +533,8 @@ jobs:
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.NEXUS_DOCKER_REGISTRY }}
-          username: ${{ secrets.NEXUS_USERNAME }}
-          password: ${{ secrets.NEXUS_PASSWORD }}
+          username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
 
       # BuildKit reads registry credentials from the client's docker config, so a
       # mirror on a different connector than the push target needs its own login —
@@ -471,8 +545,8 @@ jobs:
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ steps.buildkit.outputs.mirror }}
-          username: ${{ secrets.NEXUS_USERNAME }}
-          password: ${{ secrets.NEXUS_PASSWORD }}
+          username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
 
       - name: Log in to GitHub Container Registry
         if: inputs.push-to-ghcr
@@ -486,8 +560,8 @@ jobs:
         if: inputs.push-to-dockerhub
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_TOKEN || secrets.DOCKERHUB_TOKEN }}
 
       - name: Compose image list
         id: images
@@ -504,7 +578,7 @@ jobs:
                 echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
               fi
               if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
-                echo "${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
+                echo "${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
               fi
             } | tr '[:upper:]' '[:lower:]'
             echo "EOF"
@@ -544,10 +618,10 @@ jobs:
       - name: Compose pip index secrets
         if: inputs.mount-pip-index
         env:
-          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
-          NEXUS_PORT: ${{ secrets.NEXUS_PORT }}
-          NEXUS_USER: ${{ secrets.NEXUS_USERNAME }}
-          NEXUS_PASS: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_HOST: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
+          NEXUS_PORT: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
+          NEXUS_USER: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
+          NEXUS_PASS: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
           CTX: ${{ inputs.environment }}
         run: |
           set -euo pipefail
@@ -606,10 +680,10 @@ jobs:
       - name: Compose npm registry secret
         if: inputs.mount-npm-registry
         env:
-          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
-          NEXUS_PORT: ${{ secrets.NEXUS_PORT }}
-          NEXUS_USER: ${{ secrets.NEXUS_USERNAME }}
-          NEXUS_PASS: ${{ secrets.NEXUS_PASSWORD }}
+          NEXUS_HOST: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
+          NEXUS_PORT: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
+          NEXUS_USER: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
+          NEXUS_PASS: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
           NPM_REPO: ${{ inputs.npm-registry-repo }}
         run: |
           set -euo pipefail
@@ -708,8 +782,8 @@ jobs:
           bom-file: ${{ steps.sbom.outputs.bom-file }}
           project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || format('{0}-image', inputs.image-name) }}
           project-version: ${{ inputs.sbom-project-version }}
-          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
-          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+          server-url: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_URL || secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_API_KEY || secrets.DEPENDENCYTRACK_API_KEY }}
 
       # -----------------------------------------------------------------------
       # Vulnerability scan — Grype scans the pushed image against its CVE DB and
@@ -773,8 +847,8 @@ jobs:
         with:
           images: ${{ steps.images.outputs.list }}
           digest: ${{ steps.build.outputs.digest }}
-          private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          password: ${{ secrets.COSIGN_PASSWORD }}
+          private-key: ${{ inputs.secrets-source == 'openbao' && env.COSIGN_PRIVATE_KEY || secrets.COSIGN_PRIVATE_KEY }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.COSIGN_PASSWORD || secrets.COSIGN_PASSWORD }}
           # Same plain-HTTP connector BuildKit just pushed to. Named explicitly
           # so only the Nexus reference is signed over HTTP; the GHCR and Docker
           # Hub references in the same list keep TLS.

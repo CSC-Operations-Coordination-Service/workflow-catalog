@@ -151,11 +151,38 @@ on:
         type: boolean
         default: false
 
+      # --- secrets source -------------------------------------------------
+      secrets-source:
+        description: >
+          Where the Nexus, Docker Hub, Dependency-Track and Cosign values come
+          from. `github` (default): the repository/organization secrets, as
+          before. `openbao`: read them from OpenBao with the job's OIDC token
+          (JWT auth), for private repositories that cannot use organization
+          secrets. `openbao` needs `permissions: id-token: write` on the calling
+          job, and the containerized runner pool (runs-on: containerized).
+        required: false
+        type: string
+        default: github
+      openbao-url:
+        description: "OpenBao API URL (secrets-source: openbao)"
+        required: false
+        type: string
+        default: "https://openbao:8200"
+      openbao-role:
+        description: "OpenBao JWT role of this repository, e.g. ci-ocs-operator-app (secrets-source: openbao)"
+        required: false
+        type: string
+        default: ""
+
 jobs:
   node-ci:
     runs-on: ${{ inputs.runs-on }}
     container:
       image: node:${{ inputs.node-version }}
+      # Only in openbao mode: the job container is a sibling on the host daemon and
+      # has to join the overlay to reach https://openbao:8200. Docker (>= 25) takes
+      # a second --network next to the one the runner adds.
+      options: ${{ inputs.secrets-source == 'openbao' && '--network ocs_openbao' || '' }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -174,6 +201,18 @@ jobs:
           restore-keys: |
             npm-${{ inputs.working-directory }}-
 
+      - name: Read secrets from OpenBao
+        if: inputs.secrets-source == 'openbao' && inputs.use-nexus-registry
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          shared: |
+            NEXUS_HOST
+            NEXUS_PORT
+            NEXUS_USERNAME
+            NEXUS_PASSWORD
+
       # Writes ~/.npmrc and exports NPM_CONFIG_USERCONFIG, so every npm step
       # below resolves through Nexus. Before the install, and after the cache
       # restore — the cache holds tarballs, not registry configuration.
@@ -182,10 +221,10 @@ jobs:
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/npm-context@develop
         with:
           registry-repo: ${{ inputs.npm-registry-repo }}
-          nexus-host: ${{ secrets.NEXUS_HOST }}
-          nexus-port: ${{ secrets.NEXUS_PORT }}
-          nexus-username: ${{ secrets.NEXUS_USERNAME }}
-          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+          nexus-host: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
+          nexus-port: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
+          nexus-username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
+          nexus-password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
 
       - name: Install dependencies
         run: ${{ inputs.install-command }}
@@ -270,7 +309,7 @@ jobs:
   sbom-publish:
     needs: node-ci
     if: inputs.generate-sbom
-    runs-on: self-hosted
+    runs-on: ${{ inputs.runs-on }}
 
     steps:
       - name: Download SBOM
@@ -279,14 +318,24 @@ jobs:
           name: sbom-${{ inputs.image-name != '' && inputs.image-name || 'node' }}-package
           path: sbom
 
+      - name: Read secrets from OpenBao
+        if: inputs.secrets-source == 'openbao'
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          shared: |
+            DEPENDENCYTRACK_URL
+            DEPENDENCYTRACK_API_KEY
+
       - name: Upload SBOM to Dependency-Track
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
         with:
           bom-file: sbom/sbom-npm.cdx.json
           project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || inputs.image-name }}
           project-version: ${{ inputs.sbom-project-version }}
-          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
-          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+          server-url: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_URL || secrets.DEPENDENCYTRACK_URL }}
+          api-key: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_API_KEY || secrets.DEPENDENCYTRACK_API_KEY }}
 
   # ---------------------------------------------------------------------------
   # Optional image build — reuses the language-agnostic docker-build.yml.
@@ -294,9 +343,11 @@ jobs:
   docker:
     needs: node-ci
     if: inputs.build-image
-    permissions:
-      contents: read
-      packages: write
+    # No `permissions:` block on purpose: the job takes what the caller grants.
+    # A block here would have to name `id-token: write` for the openbao mode,
+    # and a nested job that asks for more than its caller grants fails the whole
+    # run at startup -- for every caller, openbao or not. Callers already grant
+    # contents: read and packages: write for this job.
     uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
     with:
       image-name: ${{ inputs.image-name }}
@@ -315,4 +366,8 @@ jobs:
       sbom-project-name: ${{ inputs.image-name != '' && format('{0}-image', inputs.image-name) || '' }}
       sbom-project-version: ${{ inputs.sbom-project-version }}
       sign-image: ${{ inputs.sign-image }}
+      runs-on: ${{ inputs.runs-on }}
+      secrets-source: ${{ inputs.secrets-source }}
+      openbao-url: ${{ inputs.openbao-url }}
+      openbao-role: ${{ inputs.openbao-role }}
     secrets: inherit

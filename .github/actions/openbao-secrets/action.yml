@@ -1,0 +1,92 @@
+name: "OpenBao secrets"
+description: >
+  Log in to OpenBao with the job's GitHub OIDC token (JWT auth) and export
+  secrets as environment variables for the rest of the job.
+
+  Nothing is stored in the repository: GitHub signs a short-lived token for the
+  job, and the OpenBao role named by `role` is bound to this repository, so a
+  job can only read what its role's policies allow. The calling job needs
+  `permissions: id-token: write`.
+
+  Secrets live in the kv-v2 mount `ocs`, one secret per name, with the value in
+  the key `value`:
+    shared  ->  ocs/ci/shared/<NAME>   (readable by every CI role)
+    repo    ->  ocs/ci/<repository name>/<NAME>   (this repository's role only)
+  and arrive as the environment variable <NAME>, masked in logs.
+
+  Runs on the containerized runner pool, where https://openbao:8200 resolves
+  (the overlay `ocs_openbao`). A job with a `container:` is a sibling container
+  and needs `options: --network ocs_openbao`; the reusable workflows add it.
+
+inputs:
+  openbao-url:
+    description: "OpenBao API URL, e.g. https://openbao:8200"
+    required: true
+  role:
+    description: "JWT role of this repository, e.g. ci-ocs-operator-app"
+    required: true
+  shared:
+    description: "Names under ocs/ci/shared, one per line."
+    required: false
+    default: ""
+  repo:
+    description: "Names under ocs/ci/<this repository>, one per line."
+    required: false
+    default: ""
+  audience:
+    description: "Audience of the GitHub token; must equal the role's bound audience."
+    required: false
+    default: "https://openbao:8200"
+  auth-path:
+    description: "Mount path of the JWT auth method."
+    required: false
+    default: "jwt"
+
+runs:
+  using: composite
+  steps:
+    - name: Build the secret mapping
+      id: map
+      shell: bash
+      env:
+        SHARED: ${{ inputs.shared }}
+        REPO: ${{ inputs.repo }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        {
+          echo "secrets<<EOF_MAP"
+          while IFS= read -r n; do
+            n="${n//[[:space:]]/}"; [ -n "$n" ] && echo "ocs/data/ci/shared/${n} value | ${n}"
+          done <<<"$SHARED"
+          while IFS= read -r n; do
+            n="${n//[[:space:]]/}"; [ -n "$n" ] && echo "ocs/data/ci/${REPO_NAME}/${n} value | ${n}"
+          done <<<"$REPO"
+          echo "EOF_MAP"
+          echo "ca=$(base64 -w0 "${ACTION_PATH}/openbao-ca.crt")"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Log in to OpenBao and read the secrets
+      id: login
+      # The failure is reported by the next step, with a message that says what
+      # to look at; continue-on-error only defers the stop.
+      continue-on-error: true
+      uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3.4.0
+      with:
+        url: ${{ inputs.openbao-url }}
+        method: jwt
+        path: ${{ inputs.auth-path }}
+        role: ${{ inputs.role }}
+        jwtGithubAudience: ${{ inputs.audience }}
+        caCertificate: ${{ steps.map.outputs.ca }}
+        secrets: ${{ steps.map.outputs.secrets }}
+        exportEnv: true
+
+    - name: Stop if OpenBao could not be read
+      if: steps.login.outcome == 'failure'
+      shell: bash
+      run: |
+        echo "::error::OpenBao login or secret read failed at ${{ inputs.openbao-url }} (role ${{ inputs.role }})."
+        echo "::error::Check, in order: is OpenBao SEALED (it is unsealed by hand after any restart)? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to ${{ github.repository }}? Do the secret names exist under ocs/ci?"
+        exit 1
