@@ -57,7 +57,9 @@ jobs:
 | --- | --- | --- |
 | `working-directory` (required) | — | Directory containing `package.json` |
 | `node-version` | `22` | Node major / `node:<v>` container tag |
-| `runs-on` | `self-hosted` | Runner label |
+| `runs-on` | `self-hosted` | Runner label (a single label; `containerized` for the container runner pool) |
+| `secrets-source` | `github` | `openbao`: read the Nexus / Dependency-Track / Docker Hub / Cosign values from OpenBao instead of `secrets.*`. The caller job then needs `permissions: id-token: write`. See [openbao-secrets.md](openbao-secrets.md) |
+| `openbao-url` / `openbao-role` | `https://openbao:8200` / — | OpenBao address and this repository's JWT role (`secrets-source: openbao`) |
 | `use-nexus-registry` | `false` | Install from the organization's Nexus npm registry instead of registry.npmjs.org. Also forwarded to the image build as `mount-npm-registry` |
 | `npm-registry-repo` | `npm-proxy` | Nexus repository serving npm packages (a proxy of registry.npmjs.org, or a group including one) |
 | `install-command` | `npm ci` | Dependency install |
@@ -99,7 +101,7 @@ set. The step logs which mode it used.
 
 ## Secrets
 
-Provide with `secrets: inherit`. Consumed only when the matching feature is enabled:
+Provide with `secrets: inherit` (or, for a private repository, `secrets-source: openbao`: [openbao-secrets.md](openbao-secrets.md)). Consumed only when the matching feature is enabled:
 `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` (`use-nexus-registry`);
 `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` (SBOM); `NEXUS_DOCKER_REGISTRY_DEV/_PROD`,
 `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (image).
