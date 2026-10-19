@@ -348,7 +348,9 @@ jobs:
     # and a nested job that asks for more than its caller grants fails the whole
     # run at startup -- for every caller, openbao or not. Callers already grant
     # contents: read and packages: write for this job.
-    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@develop
+    # TEMPORARY, with the openbao-secrets action refs: the new inputs only exist on
+    # this branch. All of them go back to @develop when the branch is merged.
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/openbao-secrets
     with:
       image-name: ${{ inputs.image-name }}
       context: ${{ inputs.docker-context }}

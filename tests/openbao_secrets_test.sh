@@ -32,6 +32,12 @@ check "docker-build.yml: runs-on is an input, default self-hosted" "grep -A4 '^ 
 check "node-workflow.yml: no job hardcodes self-hosted" "! grep -q '^    runs-on: self-hosted' '$NODE'"
 check "node-workflow.yml: container job joins the openbao network only in openbao mode" "grep -q -- '--network ocs_openbao' '$NODE' && grep -B2 -- '--network ocs_openbao' '$NODE' | grep -q 'secrets-source'"
 
+# --- one ref for everything this branch adds. A workflow that calls another catalog
+# workflow or the action at a different ref (e.g. @develop while the new inputs only
+# exist on the branch) is rejected by GitHub: "Invalid input, X is not defined".
+refs="$(grep -hoE 'workflow-catalog/\.github/(workflows/docker-build\.yml|actions/openbao-secrets)@[^ ]+' "$NODE" "$DOCKER" | sed -E 's/.*@//' | sort -u)"
+check "docker-build.yml and the openbao-secrets action are called at one and the same ref" "[ \"\$(wc -l <<<\"\$refs\")\" = 1 ]"
+
 # --- actionlint
 if docker image inspect rhysd/actionlint:1.7.7 >/dev/null 2>&1 || docker pull -q rhysd/actionlint:1.7.7 >/dev/null 2>&1; then
   check "actionlint is clean on the touched files" "docker run --rm -v '$ROOT:/r' -w /r rhysd/actionlint:1.7.7 -color=false .github/workflows/node-workflow.yml .github/workflows/docker-build.yml >/tmp/actionlint.out 2>&1 || (cat /tmp/actionlint.out; false)"
