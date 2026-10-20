@@ -115,6 +115,21 @@ on:
         required: false
         type: string
         default: ""
+      builder-network:
+        description: >
+          Network of the docker-container builder (buildkitd), which is the one
+          that pushes. `auto` (default): `host` when the registry resolved for
+          `environment` is a `*.ocs-registry.local` name, otherwise Docker's
+          default bridge. `host` / `bridge` force one or the other. The
+          ocs-registry.local names resolve only through the runner node's
+          /etc/hosts, to 127.0.0.1, where the routing mesh hands port 80 to
+          Traefik. A builder on the default bridge sees neither that file nor
+          the runner's overlay aliases, and its 127.0.0.1 is itself, so its push
+          fails with "no such host". On the host network it shares the node's
+          /etc/hosts and loopback. See docs/docker-build-network.md.
+        required: false
+        type: string
+        default: "auto"
       buildkit-image:
         description: >
           Image the docker-container builder itself runs on, as a full reference —
@@ -403,10 +418,32 @@ jobs:
           MIRROR_PORT: ${{ inputs.registry-mirror-port }}
           INSECURE: ${{ inputs.insecure-registry }}
           BUILDKIT_IMAGE: ${{ inputs.buildkit-image }}
+          BUILDER_NETWORK: ${{ inputs.builder-network }}
         run: |
           set -euo pipefail
           toml="$RUNNER_TEMP/buildkitd.toml"
           : > "$toml"
+
+          # Which network the builder container joins (see the builder-network
+          # input). Decided from the resolved registry, not by the caller,
+          # because the registry value comes from OpenBao or the secrets: a
+          # caller moved onto the ocs-registry.local names needs no change.
+          reg_host="${NEXUS_DOCKER_REGISTRY%%:*}"
+          case "$BUILDER_NETWORK" in
+            auto)
+              case "$reg_host" in
+                *.ocs-registry.local) net=host ;;
+                *) net="" ;;
+              esac ;;
+            host) net=host ;;
+            bridge) net="" ;;
+            *)
+              echo "::error::builder-network must be auto, host or bridge (got '$BUILDER_NETWORK')"
+              exit 1 ;;
+          esac
+          if [ "$net" = host ]; then
+            echo "BuildKit builder joins the runner node's host network (builder-network: $BUILDER_NETWORK, registry host $reg_host): it resolves the registry through the node's /etc/hosts and pushes through its 127.0.0.1"
+          fi
 
           # An explicit host:port wins; otherwise pair the given connector port
           # with the host from the registry secret.
@@ -475,6 +512,13 @@ jobs:
             echo "driver-opts<<EOF"
             if [ -n "$IMAGE" ]; then
               echo "image=$IMAGE"
+            fi
+            # buildkitd then shares the node's network namespace, and so do its
+            # RUN steps (the builder image has no CNI): a build can reach what
+            # the node reaches. The job already has the node's docker socket,
+            # so this grants nothing it did not have.
+            if [ "$net" = host ]; then
+              echo "network=host"
             fi
             if [ -n "$proxy" ]; then
               echo "env.http_proxy=$proxy"
