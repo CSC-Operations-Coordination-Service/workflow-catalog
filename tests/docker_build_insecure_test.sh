@@ -32,7 +32,8 @@ check "docs page mentions the scanner variables" \
 
 # --- actionlint (pinned container)
 if docker image inspect rhysd/actionlint:1.7.7 >/dev/null 2>&1 || docker pull -q rhysd/actionlint:1.7.7 >/dev/null 2>&1; then
-  check "actionlint is clean on docker-build.yml" "docker run --rm -v '$ROOT:/r' -w /r rhysd/actionlint:1.7.7 -color=false .github/workflows/docker-build.yml >/tmp/actionlint-insecure.out 2>&1 || (cat /tmp/actionlint-insecure.out; false)"
+  out="$(mktemp)"; trap 'rm -f "$out"' EXIT
+  check "actionlint is clean on docker-build.yml" "docker run --rm -v '$ROOT:/r' -w /r rhysd/actionlint:1.7.7 -color=false .github/workflows/docker-build.yml >\"\$out\" 2>&1 || (cat \"\$out\"; false)"
 else
   echo "SKIP - actionlint image unavailable"
 fi

@@ -770,7 +770,7 @@ jobs:
         if: inputs.generate-sbom
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/syft-sbom@develop
         env:
-          # Plain-HTTP pull from the Nexus connector; the action runs Syft in-process, so step env reaches it.
+          # Plain-HTTP pull from the Nexus connector. Reaches Syft: sbom-action@fc46e51 (node20) runs it with env = {...process.env} (src/github/SyftGithubAction.ts:111-112,175).
           SYFT_REGISTRY_INSECURE_USE_HTTP: ${{ inputs.insecure-registry && 'true' || 'false' }}
         with:
           image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
@@ -803,7 +803,7 @@ jobs:
         if: inputs.scan-image
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/grype-scan@develop
         env:
-          # Plain-HTTP pull from the Nexus connector; the action runs Grype in-process, so step env reaches it.
+          # Plain-HTTP pull from the Nexus connector. Reaches Grype: scan-action@e116508 (node24) runs it with env = {...process.env} (action.js:305-306,429).
           GRYPE_REGISTRY_INSECURE_USE_HTTP: ${{ inputs.insecure-registry && 'true' || 'false' }}
         with:
           image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
@@ -825,7 +825,7 @@ jobs:
         if: inputs.lint-image
         uses: erzz/dockle-action@e8a7c41f36f1236ca3282b298d425ffbfdb2e922 # v1.4.1
         env:
-          # Dockle's env form of --insecure (--nonssl alone is not enough); the action does not expose the flag.
+          # Dockle's env form of --insecure (--nonssl alone is not enough). Reaches Dockle: dockle-action@e8a7c41 is composite and runs `dockle` in a bash step (action.yml:56,88,90), no docker run; the action has no --insecure input.
           DOCKLE_INSECURE: ${{ inputs.insecure-registry && 'true' || 'false' }}
         with:
           image: ${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
