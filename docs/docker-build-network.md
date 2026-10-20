@@ -22,9 +22,14 @@ ignores the mounted secret is still on hop 3 no matter what the caller passes.
 
 The post-push steps that read the image back — Cosign signing, and Syft/Grype/Dockle
 when enabled — are a fifth caller against the same connector. `insecure-registry`
-is forwarded to Cosign, which otherwise resolves over HTTPS with no fallback; the
-Syft/Grype/Dockle tools pull through the runner's docker daemon and so inherit its
-`insecure-registries` instead.
+is forwarded to Cosign, which otherwise resolves over HTTPS with no fallback. It also
+switches Syft, Grype and Dockle to plain HTTP through each tool's own setting, set on
+the step (`SYFT_REGISTRY_INSECURE_USE_HTTP`, `GRYPE_REGISTRY_INSECURE_USE_HTTP`,
+`DOCKLE_INSECURE`, the env form of Dockle's `--insecure`; `--nonssl` alone is not
+enough). When the connector is plain HTTP and reached through a name that does not
+resolve to loopback (an overlay alias, for instance), those tools otherwise fail with
+`Get "https://<registry>/v2/": ... connection refused`. With `insecure-registry: false`
+the three values are `false`, the tools' default.
 
 Hop 1 happens **before** hops 2 and 3 are even possible: the `buildkitd.toml`
 mirror config and the proxy `driver-opts` are handed to a BuildKit that does not
