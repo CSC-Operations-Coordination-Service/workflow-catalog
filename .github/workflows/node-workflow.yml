@@ -164,6 +164,7 @@ on:
           empty, never taken from secrets.* (even with `secrets: inherit`).
           `openbao` needs `permissions: id-token: write` on the calling job, and
           the containerized runner pool (runs-on: containerized).
+          Any other value stops the job.
         required: false
         type: string
         default: github
@@ -216,31 +217,50 @@ jobs:
           restore-keys: |
             npm-${{ inputs.working-directory }}-
 
+      # Runs before any OpenBao read, in every mode, under sh: a job container
+      # can be an Alpine image (node:<v>-alpine, python:<v>-alpine), without bash.
+      # secrets-source: every read tests == 'openbao', so any other value (a
+      # typo such as open-bao) would quietly read the GitHub secrets instead.
       # openbao-tools is matched below with contains(' <tool> '), which takes a
       # misspelled tool, or a list split by newlines, tabs or commas, for no
       # tool at all: the read would quietly keep the ocs layout, out of reach of
-      # the action's own check for unknown tools. Refuse such a list here.
-      - name: Check openbao-tools
-        if: inputs.secrets-source == 'openbao' && inputs.openbao-tools != ''
-        shell: bash
+      # the action's own check for unknown tools. Refuse both here.
+      - name: Check secrets-source and openbao-tools
+        shell: sh
         env:
+          SECRETS_SOURCE: ${{ inputs.secrets-source }}
           OPENBAO_TOOLS: ${{ inputs.openbao-tools }}
         run: |
-          set -euo pipefail
+          set -eu
+          set -f
           known="nexus sonarqube dependency-track dockerhub cosign"
-          # One line, one space between names: the only form the matchers see.
-          re='^[a-z-]+( [a-z-]+)*$'
-          if ! [[ $OPENBAO_TOOLS =~ $re ]]; then
-            echo "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got $(printf '%q' "$OPENBAO_TOOLS")). Known: $known."
-            exit 1
+          # $1 on one line, for a message: newline, tab and CR spelled \n, \t, \r.
+          # printf, not echo: dash's echo would turn a \n back into a newline.
+          shown() { printf '%s\n' "$1" | awk '{ gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); s = s sep $0; sep = "\\n" } END { printf "%s", s }'; }
+          case $SECRETS_SOURCE in
+            github | openbao) ;;
+            *)
+              printf "::error::secrets-source must be 'github' (the default) or 'openbao', got '%s'.\n" "$(shown "$SECRETS_SOURCE")"
+              exit 1 ;;
+          esac
+          if [ "$SECRETS_SOURCE" != openbao ] || [ -z "$OPENBAO_TOOLS" ]; then
+            echo "secrets-source: $SECRETS_SOURCE"
+            exit 0
           fi
+          # One line, one space between names: the only form the matchers see.
+          # The letters are spelled out: in some locales a-z takes in capitals.
+          case $OPENBAO_TOOLS in
+            ' '* | *' ' | *'  '* | *[!abcdefghijklmnopqrstuvwxyz\ -]*)
+              printf "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got '%s'). Known: %s.\n" "$(shown "$OPENBAO_TOOLS")" "$known"
+              exit 1 ;;
+          esac
           for t in $OPENBAO_TOOLS; do
             case " $known " in
               *" $t "*) ;;
-              *) echo "::error::Unknown tool '$t' in openbao-tools. Known: $known."; exit 1 ;;
+              *) printf "::error::Unknown tool '%s' in openbao-tools. Known: %s.\n" "$t" "$known"; exit 1 ;;
             esac
           done
-          echo "openbao-tools: $OPENBAO_TOOLS"
+          echo "secrets-source: openbao, openbao-tools: $OPENBAO_TOOLS"
 
       # Exactly one of tools / shared is set: the devsecops layout when the
       # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.

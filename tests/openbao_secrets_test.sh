@@ -51,8 +51,8 @@ for f in "$NODE" "$DOCKER" "$PY"; do
     "! grep -En 'secrets\.($MANAGED)' '$f' | grep -v 'secrets-source'"
   check "$n: in openbao mode no value falls back to secrets.* (every read is the guarded form)" \
     "grep -Eq 'secrets\.($MANAGED)' '$f' && [ -z \"\$(unguarded '$f')\" ] || (unguarded '$f'; false)"
-  check "$n: a Check openbao-tools step runs in openbao mode with a non-empty list" \
-    "grep -A1 '^      - name: Check openbao-tools\$' '$f' | grep -q \"if: inputs.secrets-source == 'openbao' && inputs.openbao-tools != ''\""
+  check "$n: a 'Check secrets-source and openbao-tools' step runs under sh" \
+    "grep -A1 '^      - name: Check secrets-source and openbao-tools\$' '$f' | grep -qx '        shell: sh'"
   check "$n: logs in only when secrets-source is openbao" "grep -q \"inputs.secrets-source == 'openbao'\" '$f'"
   check "$n: openbao-tools input defaults to empty" "grep -A12 '^      openbao-tools:' '$f' | grep -q 'default: \"\"'"
   # Every read passes exactly one of tools / shared, from the same test on openbao-tools.
@@ -90,26 +90,86 @@ else
   echo "SKIP - python3 not found (guarded-form evaluation)"
 fi
 
-# The Check openbao-tools step: one text in all three workflows, run with sample lists.
+# The Check step: one text in all three workflows, run under every sh it can
+# meet, before every OpenBao read.
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  run_of "$DOCKER" docker "Check openbao-tools" >"$tmp/check.sh"
-  check "Check openbao-tools: node-workflow.yml has the same text as docker-build.yml" "run_of '$NODE' node-ci 'Check openbao-tools' | cmp -s - '$tmp/check.sh'"
-  check "Check openbao-tools: python-ci.yml has the same text as docker-build.yml" "run_of '$PY' test 'Check openbao-tools' | cmp -s - '$tmp/check.sh'"
-  tools_ok()  { env -i PATH="$PATH" OPENBAO_TOOLS="$1" bash -eo pipefail "$tmp/check.sh" >/dev/null 2>&1; }
-  # Output only; the step's own exit status is tools_ok's business (and this
-  # file runs under pipefail, so a failing step would fail the grep after it).
-  tools_err() { env -i PATH="$PATH" OPENBAO_TOOLS="$1" bash -eo pipefail "$tmp/check.sh" 2>&1 || true; }
-  check "Check openbao-tools accepts one tool" "tools_ok nexus"
-  check "Check openbao-tools accepts every known tool, single spaces" "tools_ok 'nexus sonarqube dependency-track dockerhub cosign'"
-  check "Check openbao-tools refuses a misspelled tool, naming it" "! tools_ok 'nexus sonarqbue' && tools_err 'nexus sonarqbue' | grep -q \"Unknown tool 'sonarqbue'\""
-  check "Check openbao-tools refuses a comma-separated list" "! tools_ok 'nexus,sonarqube'"
-  check "Check openbao-tools refuses a newline-separated list" "! tools_ok \$'nexus\\nsonarqube'"
-  check "Check openbao-tools refuses a trailing newline (a '>' block scalar)" "! tools_ok \$'nexus sonarqube\\n'"
-  check "Check openbao-tools refuses a tab" "! tools_ok \$'nexus\\tsonarqube'"
-  check "Check openbao-tools refuses a double space" "! tools_ok 'nexus  sonarqube'"
-  check "Check openbao-tools refuses a capitalised name" "! tools_ok 'Nexus'"
-  check "  ...and shows the list it got, escaped" "tools_err \$'nexus\\nsonarqube' | grep -qF \"\\\$'nexus\\\\nsonarqube'\""
+  STEP="Check secrets-source and openbao-tools"
+  run_of "$DOCKER" docker "$STEP" >"$tmp/check.sh"
+  check "$STEP: node-workflow.yml has the same text as docker-build.yml" "run_of '$NODE' node-ci '$STEP' | cmp -s - '$tmp/check.sh'"
+  check "$STEP: python-ci.yml has the same text as docker-build.yml" "run_of '$PY' test '$STEP' | cmp -s - '$tmp/check.sh'"
+  # It guards every read only if it runs in every mode and first: in the job
+  # that reads, or in a job that reading job needs (a failed need skips the job
+  # unless its if: says always() or !cancelled()).
+  check "$STEP: runs under sh with no if:, before every OpenBao read" "python3 - '$NODE' '$DOCKER' '$PY' '$STEP' <<'EOF'
+import sys, yaml
+*files, name = sys.argv[1:]
+for f in files:
+    jobs = yaml.safe_load(open(f))['jobs']
+    names = {j: [s.get('name') for s in job.get('steps', [])] for j, job in jobs.items()}
+    has = {j: name in n for j, n in names.items()}
+    assert any(has.values()), f
+    for j, job in jobs.items():
+        steps = job.get('steps', [])
+        if has[j]:
+            step = steps[names[j].index(name)]
+            assert step.get('shell') == 'sh' and 'if' not in step, (f, j, step.get('shell'), step.get('if'))
+        reads = [i for i, s in enumerate(steps) if 'openbao-secrets' in s.get('uses', '')]
+        if not reads:
+            continue
+        if has[j]:
+            assert names[j].index(name) < reads[0], (f, j, 'read before the check')
+        else:
+            needs = job.get('needs', [])
+            needs = [needs] if isinstance(needs, str) else needs
+            assert any(has.get(n) for n in needs), (f, j, 'no check in the job or its needs', needs)
+            cond = str(job.get('if', ''))
+            assert 'always()' not in cond and 'cancelled()' not in cond, (f, j, cond)
+EOF"
+
+  # GitHub runs `shell: sh` as `sh -e {0}`. That sh is dash on Debian and
+  # Ubuntu (node:<v>, python:<v>, the runner hosts), busybox ash on Alpine
+  # (node:<v>-alpine), bash in POSIX mode where /bin/sh is bash. Busybox runs
+  # with nothing but its own applets on PATH (awk included), as on Alpine.
+  shells="bash"
+  if command -v dash >/dev/null 2>&1; then shells="dash $shells"; else echo "SKIP - dash not found"; fi
+  if command -v busybox >/dev/null 2>&1; then
+    mkdir "$tmp/bb"
+    for a in $(busybox --list); do ln -s "$(command -v busybox)" "$tmp/bb/$a"; done
+    shells="$shells busybox"
+  else
+    echo "SKIP - busybox not found"
+  fi
+  in_sh() {  # in_sh <shell> <option> <script> [VAR=value ...]
+    local sh="$1" opt="$2" script="$3"; shift 3
+    case "$sh" in
+      dash) env -i PATH="$PATH" "$@" dash "$opt" "$script" ;;
+      bash) env -i PATH="$PATH" "$@" bash --posix "$opt" "$script" ;;
+      busybox) env -i PATH="$tmp/bb" "$@" "$tmp/bb/sh" "$opt" "$script" ;;
+    esac
+  }
+  for sh in $shells; do
+    step_ok()  { in_sh "$sh" -e "$tmp/check.sh" SECRETS_SOURCE="$1" OPENBAO_TOOLS="$2" >/dev/null 2>&1; }
+    # Output only; the step's own exit status is step_ok's business (and this
+    # file runs under pipefail, so a failing step would fail the grep after it).
+    step_err() { in_sh "$sh" -e "$tmp/check.sh" SECRETS_SOURCE="$1" OPENBAO_TOOLS="$2" 2>&1 || true; }
+    shows_escaped() { step_err openbao $'nexus\nsonarqube' | grep -qF "(got 'nexus\\nsonarqube')"; }
+    check "[$sh] $STEP: parses (-n)" "in_sh $sh -n '$tmp/check.sh'"
+    check "[$sh] accepts secrets-source github (the default), whatever openbao-tools holds" "step_ok github '' && step_ok github 'nexus,typo'"
+    check "[$sh] accepts secrets-source openbao without openbao-tools" "step_ok openbao ''"
+    check "[$sh] refuses a misspelled secrets-source, naming it" "! step_ok open-bao '' && step_err open-bao '' | grep -qF \"secrets-source must be 'github' (the default) or 'openbao', got 'open-bao'.\""
+    check "[$sh] refuses an empty, capitalised or padded secrets-source" "! step_ok '' '' && ! step_ok OpenBao '' && ! step_ok 'openbao ' '' && ! step_ok \$'openbao\\n' ''"
+    check "[$sh] accepts one tool" "step_ok openbao nexus"
+    check "[$sh] accepts every known tool, single spaces" "step_ok openbao 'nexus sonarqube dependency-track dockerhub cosign'"
+    check "[$sh] refuses a misspelled tool, naming it" "! step_ok openbao 'nexus sonarqbue' && step_err openbao 'nexus sonarqbue' | grep -q \"Unknown tool 'sonarqbue'\""
+    check "[$sh] refuses a comma-separated list" "! step_ok openbao 'nexus,sonarqube'"
+    check "[$sh] refuses a newline-separated list" "! step_ok openbao \$'nexus\\nsonarqube'"
+    check "[$sh] refuses a trailing newline (a '>' block scalar)" "! step_ok openbao \$'nexus sonarqube\\n'"
+    check "[$sh] refuses a tab" "! step_ok openbao \$'nexus\\tsonarqube'"
+    check "[$sh] refuses a double, leading or trailing space" "! step_ok openbao 'nexus  sonarqube' && ! step_ok openbao ' nexus' && ! step_ok openbao 'nexus '"
+    check "[$sh] refuses a capitalised name, and a glob" "! step_ok openbao 'Nexus' && ! step_ok openbao 'nex*'"
+    check "[$sh]   ...and shows the list it got on one line, a newline as \\n" shows_escaped
+  done
 
   # python-ci's SonarQube preflight names the OpenBao path of an empty value.
   run_of "$PY" sonarqube "Check SonarQube URL and token" >"$tmp/sonar.sh"
