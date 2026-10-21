@@ -48,8 +48,9 @@ jobs:
     secrets: inherit
 ```
 
-> Pin `@develop` for the latest, or a tag (e.g. `@1.2.3`) for reproducibility once the
-> catalog is released.
+> Pin a release tag (e.g. `@1.2.3`) or its commit SHA, never a branch, once a pipeline
+> handles real secrets: see [releasing.md](releasing.md). `@develop` is for trying the
+> catalog's latest changes.
 
 ## Inputs
 

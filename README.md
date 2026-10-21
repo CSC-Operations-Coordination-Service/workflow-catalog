@@ -36,6 +36,7 @@ full building-block reference, composition styles, use cases, and conventions.
 - [Security scanning (Gitleaks & Grype)](docs/security-scanning.md)
 - [Node/React reusable workflow](docs/node-workflow.md)
 - [Manual develop image builds](docs/manual-docker-build-develop.md)
+- [Releasing and pinning the catalog](docs/releasing.md)
 
 ## `python-demo`
 

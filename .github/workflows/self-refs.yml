@@ -1,0 +1,47 @@
+name: Catalog self-references
+
+# The catalog's workflows call its own actions and workflows by
+# owner/repo/path@ref. A caller that pins the catalog at a tag or a commit SHA
+# freezes only the workflow it calls: a self-reference left at @develop inside
+# it still runs whatever develop holds today, including the steps that receive
+# the caller's secrets (cosign-sign, nexus-context, dependency-track-upload).
+# So this fails:
+#   - a pushed tag whose self-references do not all name that tag (a release
+#     is a commit that pins them to its tag, then the tag on that commit);
+#   - a pull request into develop whose self-references do not all name
+#     develop (a feature branch that still calls itself at its own name).
+# The fix in both cases: scripts/pin-catalog-refs.sh <ref>, then commit
+# (docs/releasing.md). A protected tag cannot be moved: a red tag means a new
+# release, so run the --check before tagging.
+#
+# It reads files only: a GitHub-hosted runner, a read-only token that the
+# checkout does not keep, no secrets. github values reach the script through
+# the environment (GITHUB_REF_NAME), never as ${{ }} inside run:, where a tag
+# name chosen by whoever pushes it would be pasted into the script as code.
+
+on:
+  push:
+    tags:
+      - "**"
+  pull_request:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  self-refs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check self-references (tag)
+        if: github.event_name == 'push'
+        run: bash scripts/pin-catalog-refs.sh --check "$GITHUB_REF_NAME"
+
+      - name: Check self-references (pull request into develop)
+        if: github.event_name == 'pull_request'
+        run: bash scripts/pin-catalog-refs.sh --check develop

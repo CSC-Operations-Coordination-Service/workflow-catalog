@@ -7,7 +7,8 @@ and composite actions — shared across projects. It is consumed two ways:
   caller ([`python-demo.yml`](../.github/workflows/python-demo.yml)) that wires
   the building blocks together — a working example of the catalog in use.
 - **Cross-repo**: other repositories reference the reusable workflows directly,
-  e.g. `uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@develop`.
+  e.g. `uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@1.2.3`,
+  pinned to a release ([releasing.md](releasing.md)).
 
 ## Architecture
 
@@ -161,8 +162,9 @@ The reusable workflows reference the composite actions by their **full**
 never as `./.github/actions/<name>`. A local `./` path resolves against the
 *caller's* checked-out workspace, not the catalog's, so it breaks the moment a
 reusable workflow is consumed from another repository. Keep the full form when
-you add an action reference, and bump the `@develop` refs together when the
-catalog moves to a tag.
+you add an action reference. A release pins every one of these refs to its own
+tag with `scripts/pin-catalog-refs.sh`, and a branch pins them back to
+`@develop` before it is merged: see [releasing.md](releasing.md).
 
 In your own jobs you can use either form: reference a catalog action with the
 full form above, or check the catalog out and use a local path.
@@ -173,4 +175,5 @@ full form above, or check the catalog out and use a local path.
 - [security-scanning.md](security-scanning.md) — Gitleaks secret scanning, Grype image CVE gate & Cosign image signing
 - [node-workflow.md](node-workflow.md) — the Node/React reusable workflow
 - [manual-docker-build-develop.md](manual-docker-build-develop.md) — manual image builds on develop
+- [releasing.md](releasing.md) — releasing the catalog, pinning its self-references, and how callers pin it
 - [docker-build-network.md](docker-build-network.md) — the three network hops of an image build on a runner with no internet egress (builder image, `FROM` resolution, push) and which input covers each

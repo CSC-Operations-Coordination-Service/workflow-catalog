@@ -408,7 +408,7 @@ jobs:
   # Publish the npm SBOM from the runner host, deliberately without
   # `container:`. Dependency-Track is an internal service; from inside a job
   # container — own resolver, no route to a host-published port — the upload
-  # fails as `curl: (7) Failed to connect to *** port 5055 after 1 ms`. Same
+  # fails as `curl: (7) Failed to connect to *** port <port> after 1 ms`. Same
   # reasoning as the `publish` job in sbom.yml. Takes the SBOM from the artifact
   # the job above uploaded, so no checkout is needed here (which is why the
   # composite action must stay referenced as owner/repo/path@ref).
@@ -456,7 +456,7 @@ jobs:
     # contents: read and packages: write for this job.
     # TEMPORARY, with the openbao-secrets action refs: the new inputs only exist on
     # this branch (ci/openbao-secrets). All of them go back to @develop when the
-    # branch is merged.
+    # branch is merged: scripts/pin-catalog-refs.sh develop (docs/releasing.md).
     uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/openbao-secrets
     with:
       image-name: ${{ inputs.image-name }}
