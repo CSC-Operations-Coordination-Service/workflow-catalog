@@ -373,3 +373,9 @@ first thing to check is whether OpenBao is **sealed**.
 A job with `container:` is a sibling container on the node and is not on the
 OpenBao overlay: the reusable workflows add `options: --network ocs_openbao` in
 openbao mode. Do the same in a `container:` job of your own.
+
+The action trusts the CA it bundles (`openbao-ca.crt`), read through
+`$GITHUB_ACTION_PATH`, which the runner translates into a job container's paths
+(the `github.action_path` context is not translated). If that file is missing or
+empty, the job stops at the step "Read the bundled OpenBao CA" with an error that
+names it, not later at the login with a misleading "is OpenBao SEALED?".

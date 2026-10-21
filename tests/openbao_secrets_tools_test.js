@@ -1,13 +1,20 @@
 // Behaviour of the openbao-secrets action's devsecops layout (`tools`), run
 // against a mock OpenBao over TLS. Started by tests/openbao_secrets_tools_test.sh,
-// which extracts the action's script and makes a throwaway CA and certificate:
-//   node openbao_secrets_tools_test.js <script.js> <action-dir> <key.pem> <cert.pem>
+// which extracts the action's script, makes a throwaway CA and certificate, and
+// runs the action's CA step on that CA (<ca-step-output>: its GITHUB_OUTPUT):
+//   node openbao_secrets_tools_test.js <script.js> <ca-step-output> <ca.crt> <key.pem> <cert.pem>
 'use strict';
 const fs = require('fs');
 const https = require('https');
+const path = require('path');
 
-const [scriptFile, actionDir, keyFile, certFile] = process.argv.slice(2);
+const [scriptFile, caOutputFile, caFile, keyFile, certFile] = process.argv.slice(2);
 const script = fs.readFileSync(scriptFile, 'utf8');
+// What the CA step wrote: one line, ca=<base64 of the CA>.
+const caOutput = fs.readFileSync(caOutputFile, 'utf8');
+const caFromStep = (caOutput.match(/^ca=(.*)$/m) || [])[1] || '';
+// A CA that did not sign the mock's certificate: the one the action bundles.
+const otherCa = Buffer.from(fs.readFileSync(path.join(__dirname, '..', '.github', 'actions', 'openbao-secrets', 'openbao-ca.crt'))).toString('base64');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 // --- mock OpenBao: roles ci-x, ci-x-release and ci-x-sign, a few secrets -----
@@ -58,7 +65,13 @@ async function run(envOverrides, { idToken = true } = {}) {
     OPENBAO_ROLE: 'ci-x', OPENBAO_AUDIENCE: 'https://openbao:8200', OPENBAO_AUTH_PATH: 'jwt',
     OPENBAO_TOOLS: '', OPENBAO_SHARED: '', OPENBAO_REPO: '', OPENBAO_ENVIRONMENT: '',
     REF_TYPE: 'branch', REF_NAME: 'develop', REPOSITORY: 'org/repo-x', REPO_NAME: 'repo-x',
-    ACTION_PATH: actionDir,
+    OPENBAO_CA: caFromStep,
+    // What the script sees in a job with a container:, where neither holds the
+    // CA: ACTION_PATH as the old steps filled it from the github.action_path
+    // context (the runner's path, not translated into the container), and
+    // GITHUB_ACTION_PATH, which inside github-script names github-script.
+    ACTION_PATH: '/runner-side/_actions/no-such-dir',
+    GITHUB_ACTION_PATH: '/__w/_actions/github-script/no-such-dir',
   };
   const saved = { ...process.env };
   Object.assign(process.env, base, envOverrides);
@@ -103,7 +116,12 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
 (async () => {
   await new Promise((r) => server.listen(0, 'localhost', r));
 
+  // The CA, as the action's CA step hands it over.
+  check("the action's CA step writes one line, ca=<the CA, base64 on one line>",
+    /^ca=[A-Za-z0-9+/=]+\n$/.test(caOutput) && Buffer.from(caFromStep, 'base64').equals(fs.readFileSync(caFile)));
+
   let o = await run({ OPENBAO_TOOLS: 'nexus' });
+  check("the CA from the action's CA step logs in over TLS, with ACTION_PATH and GITHUB_ACTION_PATH at directories that do not exist", o.error === null && o.logins.join() === 'ci-x');
   check('branch build: no error', o.error === null);
   check('branch build: logs in as the base role', o.logins.join() === 'ci-x' && o.exported.NEXUS_USERNAME === 'ci-user-dev');
   check('branch build: reads devsecops/ci/dev/nexus', o.requests.includes('GET /v1/devsecops/data/ci/dev/nexus'));
@@ -221,6 +239,14 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
 
   o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_URL: 'https://localhost:1' });
   check('an unreachable OpenBao stops with the checklist', /cannot be reached.*SEALED/.test(o.error || ''));
+
+  // The CA is the one the step passes, and nothing stands in for it.
+  o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_CA: otherCa });
+  check('a CA that did not sign the server\'s certificate: TLS refuses it, no login is sent', /cannot be reached/.test(o.error || '') && o.logins.length === 0);
+  o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_CA: '' });
+  check("no CA from the CA step stops, naming that step, before any request", /The OpenBao CA did not reach this step.*'Read the bundled OpenBao CA'/.test(o.error || '') && o.requests.length === 0);
+  o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_CA: Buffer.from('not a certificate').toString('base64') });
+  check('  ...and so does one that holds no PEM certificate', /The OpenBao CA did not reach this step/.test(o.error || '') && o.requests.length === 0);
 
   server.close();
   process.exit(fail);

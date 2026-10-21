@@ -106,6 +106,36 @@ runs:
         printf "::error::openbao-url must be an https:// URL, on one line, without spaces (got '%s'): the login sends the job's OIDC token and the reply carries the secrets, so neither may cross the network in clear.\n" "$(printf '%s' "$OPENBAO_URL" | tr '\t\n\r' '   ')"
         exit 1
 
+    # Both layouts: the CA bundled with this action, base64 on one line (it is
+    # public), for vault-action's caCertificate and for the devsecops script.
+    # Read through $GITHUB_ACTION_PATH: in a job with a `container:`, the runner
+    # translates the GITHUB_* variables into the container's paths (its work
+    # directory is mounted at /__w), but not the github.action_path context,
+    # which keeps the runner's own path, absent from the container. The
+    # devsecops script cannot read the file itself either: inside
+    # actions/github-script, GITHUB_ACTION_PATH names github-script's directory.
+    # Checked before any output, each command on its own, never inside echo's
+    # argument, where a failure does not stop a step under -e: an empty ca=
+    # would fail the job only at the login, under the misleading "is OpenBao
+    # SEALED?". Under sh: the job may run in an Alpine container, without bash.
+    - name: Read the bundled OpenBao CA
+      id: ca
+      shell: sh
+      run: |
+        ca_file="${GITHUB_ACTION_PATH:-}/openbao-ca.crt"
+        if ! grep -qse '-----BEGIN CERTIFICATE-----' "$ca_file"; then
+          echo "::error::The OpenBao CA bundled with this action, $ca_file, is missing, empty or holds no PEM certificate. The action reads it through GITHUB_ACTION_PATH, which the runner sets for every step, inside a job container too."
+          exit 1
+        fi
+        # Not checked by -e: a pipeline's status is tr's, so a missing base64
+        # would leave ca empty.
+        ca="$(base64 <"$ca_file" | tr -d '\n')"
+        if [ -z "$ca" ]; then
+          echo "::error::Could not base64-encode the OpenBao CA $ca_file: does the job's container have base64?"
+          exit 1
+        fi
+        echo "ca=$ca" >>"$GITHUB_OUTPUT"
+
     # --- ocs layout: ocs/ci/shared/<NAME>, ocs/ci/<repo>/<NAME> ----------------
     - name: Build the secret mapping
       id: map
@@ -115,7 +145,6 @@ runs:
         SHARED: ${{ inputs.shared }}
         REPO: ${{ inputs.repo }}
         REPO_NAME: ${{ github.event.repository.name }}
-        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
         # Split on any whitespace, so a caller can pass the names on one line
@@ -126,7 +155,6 @@ runs:
           for n in $SHARED; do echo "ocs/data/ci/shared/${n} value | ${n}"; done
           for n in $REPO; do echo "ocs/data/ci/${REPO_NAME}/${n} value | ${n}"; done
           echo "EOF_MAP"
-          echo "ca=$(base64 -w0 "${ACTION_PATH}/openbao-ca.crt")"
         } >> "$GITHUB_OUTPUT"
 
     - name: Log in to OpenBao and read the secrets
@@ -142,7 +170,7 @@ runs:
         path: ${{ inputs.auth-path }}
         role: ${{ inputs.role }}
         jwtGithubAudience: ${{ inputs.audience }}
-        caCertificate: ${{ steps.map.outputs.ca }}
+        caCertificate: ${{ steps.ca.outputs.ca }}
         secrets: ${{ steps.map.outputs.secrets }}
         exportEnv: true
 
@@ -198,12 +226,12 @@ runs:
         REF_NAME: ${{ github.ref_name }}
         REPOSITORY: ${{ github.repository }}
         REPO_NAME: ${{ github.event.repository.name }}
-        ACTION_PATH: ${{ github.action_path }}
+        # From the step 'Read the bundled OpenBao CA': see there why this
+        # script does not read the file itself.
+        OPENBAO_CA: ${{ steps.ca.outputs.ca }}
       with:
         script: |
-          const fs = require('fs');
           const https = require('https');
-          const path = require('path');
           const env = process.env;
           const words = (s) => [...new Set((s || '').split(/\s+/).filter(Boolean))];
 
@@ -301,7 +329,14 @@ runs:
           // --- HTTPS to OpenBao. Node's https ignores HTTPS_PROXY, which is what
           // we want: openbao:8200 is on the overlay, never behind the egress proxy.
           const base = env.OPENBAO_URL.replace(/\/+$/, '');
-          const ca = fs.readFileSync(path.join(env.ACTION_PATH, 'openbao-ca.crt'), 'utf8');
+          // The bundled CA, base64, from the action's step before this one
+          // (inside github-script, GITHUB_ACTION_PATH names github-script's
+          // directory). That step stops on a missing CA; this is the same
+          // rule, so that no TLS error ever stands in for it.
+          const ca = Buffer.from(env.OPENBAO_CA || '', 'base64').toString('utf8');
+          if (!ca.includes('-----BEGIN CERTIFICATE-----')) {
+            throw new Error("The OpenBao CA did not reach this step (OPENBAO_CA holds no PEM certificate): the action's step 'Read the bundled OpenBao CA' passes it.");
+          }
           const call = (method, apiPath, { token, body } = {}) => new Promise((resolve, reject) => {
             const data = body === undefined ? undefined : JSON.stringify(body);
             const headers = { Accept: 'application/json' };

@@ -674,6 +674,80 @@ EOF
   check "action: the refusal is an ::error:: that asks for https://" \
     "{ url_run http://bao.example.internal:8200 2>&1; true; } | grep -q '^::error::openbao-url must be an https:// URL'"
 
+  # The bundled CA: one step for both layouts reads it through
+  # $GITHUB_ACTION_PATH, which the runner translates into a job container's
+  # paths. The github.action_path context keeps the runner's own path, which a
+  # job with a container: does not have, and inside github-script
+  # GITHUB_ACTION_PATH names github-script: nothing may read the CA that way.
+  ca_wiring() { python3 - "$ACT" <<'EOF'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+steps = d["runs"]["steps"]
+names = [s.get("name") for s in steps]
+i = names.index("Read the bundled OpenBao CA")
+ca = steps[i]
+assert i == 1, ("the CA step is not right after 'Check openbao-url'", i)
+assert ca.get("id") == "ca" and ca.get("shell") == "sh" and "if" not in ca and "env" not in ca, ca
+login = [s for s in steps if "vault-action" in s.get("uses", "")][0]
+assert login["with"]["caCertificate"] == "${{ steps.ca.outputs.ca }}", login["with"]["caCertificate"]
+gs = [s for s in steps if "github-script" in s.get("uses", "")][0]
+assert gs["env"]["OPENBAO_CA"] == "${{ steps.ca.outputs.ca }}", gs["env"].get("OPENBAO_CA")
+# What the action runs, its comments left out.
+assert "github.action_path" not in str(d), "github.action_path is read"
+assert not any("ACTION_PATH" in (s.get("env") or {}) for s in steps), "an ACTION_PATH env is set"
+EOF
+  }
+  check "action: one sh step, 'Read the bundled OpenBao CA', right after 'Check openbao-url' with no if:, feeds both layouts, and nothing reads github.action_path" ca_wiring
+  # The step under every sh it can meet (in_sh and $shells: above), with
+  # GITHUB_ACTION_PATH at the action's real directory or a broken copy, and
+  # ACTION_PATH, which the old steps read, at a directory that does not exist,
+  # as a container job sees it. ca_run <shell> [VAR=value ...]: the step's
+  # output in $tmp/ca.out, what it printed in $tmp/ca.log.
+  step_run "$ACT" 'Read the bundled OpenBao CA' >"$tmp/ca.sh"
+  CA_DIR="$ROOT/.github/actions/openbao-secrets"
+  mkdir -p "$tmp/ca-none" "$tmp/ca-empty" "$tmp/ca-text" "$tmp/nob64" "$tmp/nob64-bb"
+  : >"$tmp/ca-empty/openbao-ca.crt"
+  printf 'not a certificate\n' >"$tmp/ca-text/openbao-ca.crt"
+  # A PATH with grep and tr but no base64, for each kind of sh (and the shell
+  # itself: env looks it up on the new PATH).
+  for t in grep tr dash bash; do
+    if command -v "$t" >/dev/null 2>&1; then ln -s "$(command -v "$t")" "$tmp/nob64/$t"; fi
+  done
+  for t in grep tr; do
+    if command -v busybox >/dev/null 2>&1; then ln -s "$(command -v busybox)" "$tmp/nob64-bb/$t"; fi
+  done
+  ca_run() {
+    local sh="$1"; shift
+    : >"$tmp/ca.out"
+    in_sh "$sh" -e "$tmp/ca.sh" GITHUB_OUTPUT="$tmp/ca.out" ACTION_PATH="$tmp/runner-side/_actions/no-such-dir" "$@" >"$tmp/ca.log" 2>&1
+  }
+  ca_read() {  # ca_read <shell>: the action's own CA, whole, on one output line
+    ca_run "$1" GITHUB_ACTION_PATH="$CA_DIR" && [ "$(grep -c '' "$tmp/ca.out")" = 1 ] \
+      && sed -n 's/^ca=//p' "$tmp/ca.out" | base64 -d | cmp -s - "$CA_DIR/openbao-ca.crt"
+  }
+  ca_refused() {  # ca_refused <shell> <dir>: stops, names the file, writes no output
+    ! ca_run "$1" GITHUB_ACTION_PATH="$2" && [ ! -s "$tmp/ca.out" ] \
+      && grep -qxF "::error::The OpenBao CA bundled with this action, $2/openbao-ca.crt, is missing, empty or holds no PEM certificate. The action reads it through GITHUB_ACTION_PATH, which the runner sets for every step, inside a job container too." "$tmp/ca.log"
+  }
+  ca_nob64() {  # ca_nob64 <shell>: no base64 on PATH stops the step, naming it, and writes no output
+    local p="$tmp/nob64"; [ "$1" = busybox ] && p="$tmp/nob64-bb"
+    ! ca_run "$1" GITHUB_ACTION_PATH="$CA_DIR" PATH="$p" && [ ! -s "$tmp/ca.out" ] \
+      && grep -qxF "::error::Could not base64-encode the OpenBao CA $CA_DIR/openbao-ca.crt: does the job's container have base64?" "$tmp/ca.log"
+  }
+  for sh in $shells; do
+    check "[$sh] CA step: parses (-n)" "in_sh $sh -n '$tmp/ca.sh'"
+    # Alpine's busybox has base64; a build without it cannot run this one.
+    if [ "$sh" = busybox ] && ! busybox base64 </dev/null >/dev/null 2>&1; then
+      echo "SKIP - [busybox] this busybox has no base64 applet (Alpine's has): the CA is read under the other shells"
+    else
+      check "[$sh] CA step: reads the action's CA through GITHUB_ACTION_PATH, the old ACTION_PATH at a directory that does not exist" "ca_read $sh"
+    fi
+    check "[$sh] CA step: a missing CA stops it with an ::error:: naming the file, and writes no output" "ca_refused $sh '$tmp/ca-none'"
+    check "[$sh] CA step: so does an empty CA" "ca_refused $sh '$tmp/ca-empty'"
+    check "[$sh] CA step: and a file that holds no PEM certificate" "ca_refused $sh '$tmp/ca-text'"
+    check "[$sh] CA step: without base64 it stops, naming it, and writes no empty ca=" "ca_nob64 $sh"
+  done
+
   # A ${{ }} inside a script is pasted into it before the shell starts: an input
   # or a secret holding a quote or $(...) would run as code. Every value goes
   # through env:. The one exception is by design: node-workflow's four command
