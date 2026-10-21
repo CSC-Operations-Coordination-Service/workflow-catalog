@@ -266,7 +266,7 @@ jobs:
       # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
       - name: Read secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.use-nexus-registry
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
@@ -380,7 +380,7 @@ jobs:
 
       - name: Read secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
@@ -408,9 +408,9 @@ jobs:
     # run at startup -- for every caller, openbao or not. Callers already grant
     # contents: read and packages: write for this job.
     # TEMPORARY, with the openbao-secrets action refs: the new inputs only exist on
-    # this branch (ci/devsecops-secrets). All of them go back to @develop when the
+    # this branch (ci/openbao-secrets). All of them go back to @develop when the
     # branch is merged.
-    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/devsecops-secrets
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/openbao-secrets
     with:
       image-name: ${{ inputs.image-name }}
       context: ${{ inputs.docker-context }}

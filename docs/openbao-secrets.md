@@ -184,7 +184,7 @@ use `bao kv patch` with the same form.
 
 ### Test it from a pilot repository
 
-While the branch `ci/devsecops-secrets` is under test, call the catalog at that
+While the branch `ci/openbao-secrets` is under test, call the catalog at that
 ref. Its own workflows call the action and `docker-build.yml` at the same ref.
 
 ```yaml
@@ -194,7 +194,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@ci/devsecops-secrets
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@ci/openbao-secrets
     with:
       runs-on: containerized
       secrets-source: openbao
@@ -214,7 +214,7 @@ jobs:
    `openbao-tools`, or a misspelled `secrets-source`, stops the job at
    "Check secrets-source and openbao-tools".
 
-Before the branch is merged, every `@ci/devsecops-secrets` ref inside the
+Before the branch is merged, every `@ci/openbao-secrets` ref inside the
 catalog goes back to `@develop`, and the pilots move to `@develop` with it.
 
 The action's devsecops read can be tested locally against a mock OpenBao:
