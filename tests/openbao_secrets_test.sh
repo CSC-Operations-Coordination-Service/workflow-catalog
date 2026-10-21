@@ -28,8 +28,10 @@ check "action logs in as <role>-release on tag builds" "grep -q \"REF_TYPE === '
 check "the ocs-layout steps run only without tools" "[ \"\$(grep -c \"if: inputs.tools == ''\\$\" '$ACT')\" = 2 ] && grep -q \"if: inputs.tools == '' && steps.login.outcome == 'failure'\" '$ACT'"
 check "action has a required-field list per tool (behaviour: tools test)" "grep -q 'const REQUIRED = {' '$ACT'"
 check "a failed ocs read lists the ocs/ci paths it needed" "grep -q 'paths=\"\$paths ocs/ci/shared/\$n\"' '$ACT'"
-# scripts/ci-secrets does not write devsecops/ci/<kind>/<tool> yet: nothing may say it does.
-check "the action does not name scripts/ci-secrets as the devsecops writer" "! grep -q 'scripts/ci-secrets writes' '$ACT' && grep -q 'does not write this layout yet' '$ACT'"
+# csc-ocs-ansible's scripts/ci-secrets writes devsecops/ci/<kind>/<tool> with
+# --layout devsecops: the operator's message names it, and nothing still says
+# it does not write this layout.
+check "the devsecops message names ci_secrets.py --layout devsecops as the writer" "grep 'const HOWTO' '$ACT' | grep -q -- 'scripts/ci-secrets/ci_secrets.py .*--layout devsecops' && ! grep -q 'does not write this layout' '$ACT' && ! grep -q 'until csc-ocs-ansible' '$ACT'"
 
 # --- the workflows
 # Reads of a managed value that are NOT in the guarded form

@@ -125,9 +125,10 @@ runs:
       run: |
         echo "::error::OpenBao login or secret read failed at ${{ inputs.openbao-url }} (role ${{ inputs.role }})."
         echo "::error::Check, in order: is OpenBao SEALED (it is unsealed by hand after any restart)? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to ${{ github.repository }}? Do the secret names exist under ocs/ci?"
-        # The paths, never the values: one path that nothing writes (for
-        # python-ci, ocs/ci/shared/SONAR_HOST_URL) fails the whole read, and
-        # the list says where to look without opening the role's policies.
+        # The paths, never the values: one path that no operator has stored
+        # yet (for python-ci, ocs/ci/shared/SONAR_HOST_URL, say) fails the
+        # whole read, and the list says where to look without opening the
+        # role's policies.
         set -f
         paths=""
         for n in $SHARED; do paths="$paths ocs/ci/shared/$n"; done
@@ -176,10 +177,11 @@ runs:
 
           // The contract with csc-ocs-ansible: field of
           // devsecops/ci/<kind>/<tool> -> variable the workflows read.
-          // csc-ocs-ansible's scripts/ci-secrets does not write this layout yet:
-          // an operator writes each secret by hand with
-          // `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`. When that
-          // script learns the layout, change it and this map together.
+          // An operator writes each secret, with csc-ocs-ansible's
+          // scripts/ci-secrets/ci_secrets.py --layout devsecops (dry run first),
+          // or by hand with `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
+          // That script's paths and field names are this map and REQUIRED:
+          // change them together.
           const MAP = {
             nexus: {
               host: 'NEXUS_HOST', port: 'NEXUS_PORT',
@@ -207,11 +209,12 @@ runs:
           // A number is fine (an operator may store port=8082 as JSON); blank,
           // a boolean, an object or null is not a value a workflow can use.
           const usable = (v) => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '');
-          // How an operator fixes a missing secret or field. Values go in on
-          // stdin (`field=-`, typed or piped, one per command) or from a file
-          // (`field=@path`), never as an argument, where the shell history and
-          // the process list would keep them.
-          const HOWTO = (tool) => `An operator writes it by hand, until csc-ocs-ansible's scripts/ci-secrets supports this layout: bao kv put -mount=devsecops ci/${kind}/${tool} <field>=... (bao kv patch to add a field), each secret field as <field>=- (stdin) or <field>=@<file>, never as an argument. A pipeline never writes it.`;
+          // How an operator fixes a missing secret or field: the script's
+          // components have the tool names of MAP, so --only <tool> fits. By
+          // hand, values go in on stdin (`field=-`, typed or piped, one per
+          // command) or from a file (`field=@path`), never as an argument,
+          // where the shell history and the process list would keep them.
+          const HOWTO = (tool) => `An operator stores it with csc-ocs-ansible's scripts/ci-secrets/ci_secrets.py --env <credentials file> --layout devsecops --only ${tool} (with --dry-run first), or by hand: bao kv put -mount=devsecops ci/${kind}/${tool} <field>=... (bao kv patch to add a field), each secret field as <field>=- (stdin) or <field>=@<file>, never as an argument. A pipeline never writes it.`;
 
           // --- refuse a bad request before talking to OpenBao. Object.hasOwn,
           // not `in`: 'constructor' is `in` every object.
@@ -314,7 +317,7 @@ runs:
           }
           for (const name of words(env.OPENBAO_REPO)) {
             const label = `ocs/ci/${env.REPO_NAME}/${name}`;
-            const STORE = 'An operator stores it (csc-ocs-ansible scripts/ci-secrets, or bao kv put); a pipeline never writes it.';
+            const STORE = 'An operator stores it by hand: bao kv put -mount=ocs ci/<repo>/<name> value=- (stdin) or value=@<file>, never as an argument (csc-ocs-ansible scripts/ci-secrets writes no ocs/ci/<repo> secret). A pipeline never writes it.';
             const data = await read(`ocs/data/ci/${env.REPO_NAME}/${name}`, label, STORE);
             // The rule of a required field: a blank value would only resurface
             // later as an empty variable, far from its cause.

@@ -234,9 +234,12 @@ jobs:
 
     steps:
       # In the ocs layout this reads ocs/ci/shared/SONAR_TOKEN and
-      # ocs/ci/shared/SONAR_HOST_URL. csc-ocs-ansible's scripts/ci-secrets does
-      # not write SONAR_HOST_URL: an operator stores it by hand, or the caller
-      # lists sonarqube in openbao-tools (devsecops/ci/<dev|prod>/sonarqube).
+      # ocs/ci/shared/SONAR_HOST_URL; with sonarqube in openbao-tools,
+      # devsecops/ci/<dev|prod>/sonarqube instead. An operator stores them with
+      # csc-ocs-ansible's scripts/ci-secrets/ci_secrets.py, dry run first
+      # (ocs layout: its default layout, component static for SONAR_HOST_URL
+      # and sonarqube for SONAR_TOKEN; devsecops: --layout devsecops), or by
+      # hand with bao kv put.
       # A missing path stops the job at this read, naming the paths.
       - name: Read SonarQube secrets from OpenBao
         if: inputs.secrets-source == 'openbao'

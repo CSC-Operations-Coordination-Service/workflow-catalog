@@ -74,9 +74,11 @@ kv-v2 mount `ocs`, one secret per name, the value in the key `value`:
 | `ocs/ci/shared/<NAME>` (`NEXUS_HOST`, `NEXUS_PASSWORD`, `DOCKERHUB_TOKEN`, ...) | every CI role |
 | `ocs/ci/<repository>/<NAME>` | that repository's role only |
 
-An operator writes them (`bao kv put ocs/ci/shared/NEXUS_PASSWORD value=-`), never
-a pipeline. Roles and policies are in csc-ocs-ansible
-(`stacks/platform/openbao/openbao-config.yml`).
+An operator writes them, never a pipeline: `ocs/ci/shared/<NAME>` with
+csc-ocs-ansible's `scripts/ci-secrets/ci_secrets.py` (its default layout) or by
+hand, `ocs/ci/<repository>/<NAME>` by hand only. By hand, the value goes in
+from stdin: `bao kv put ocs/ci/shared/NEXUS_PASSWORD value=-`. Roles and
+policies are in csc-ocs-ansible (`stacks/platform/openbao/openbao-config.yml`).
 
 The names each workflow reads from `ocs/ci/shared`, for a tool not listed in
 `openbao-tools`. Every name read must exist: one missing path stops the read.
@@ -94,11 +96,23 @@ without its value.
 | `docker-build.yml` | `sign-image` on a `release` build | `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` |
 | `python-ci.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `SONAR_TOKEN`, `SONAR_HOST_URL` |
 
-`python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`, and csc-ocs-ansible's
-`scripts/ci-secrets` does not write it. Until an operator stores it by hand, a
-`python-ci.yml` caller in openbao mode must list `sonarqube` in `openbao-tools`, so
-the URL and token come from `devsecops/ci/<dev|prod>/sonarqube`. Otherwise the
-`sonarqube` job stops at its OpenBao read.
+`python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`. csc-ocs-ansible's
+`scripts/ci-secrets/ci_secrets.py` stores it: its default layout, component
+`static`, from the credentials-file key `SONAR_HOST_URL` (it removes a trailing
+`/`, which `python-ci.yml` refuses). Run it with `--dry-run` first: it reads
+OpenBao, says what it would store, and writes nothing.
+
+```bash
+python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --only static --dry-run
+python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --only static
+```
+
+While `ocs/ci/shared/SONAR_HOST_URL` is not stored, the `sonarqube` job of a
+`python-ci.yml` caller in openbao mode stops at its OpenBao read, unless the
+caller lists `sonarqube` in `openbao-tools`: the URL and token then come from
+`devsecops/ci/<dev|prod>/sonarqube`, which must be stored instead.
+`bao kv metadata get -mount=ocs ci/shared/SONAR_HOST_URL` shows whether it
+exists, without its value.
 
 ### The devsecops layout (`openbao-tools`)
 
@@ -139,9 +153,23 @@ skipped.
 the only builds that sign. A branch build never needs a signing key in
 `devsecops/ci/dev`.
 
-This map is the contract with csc-ocs-ansible: change both together. Its
-`scripts/ci-secrets` does not write this layout yet. Until it does, an operator
-writes each secret by hand with `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
+This map is the contract with csc-ocs-ansible: change both together. An
+operator writes each secret, never a pipeline, in one of two ways.
+
+With csc-ocs-ansible's `scripts/ci-secrets/ci_secrets.py --layout devsecops`. It
+reads the values from a credentials file (chmod 600, outside any repository),
+can mint the SonarQube token and the Dependency-Track key, and keeps a field
+already stored unless told to rotate it. Its components have the tool names
+above, so `--only` takes them. Run it with `--dry-run` first: it reads OpenBao,
+says what it would store or mint, and writes and mints nothing. Its
+`scripts/ci-secrets/README.md` gives the credentials-file key of each field.
+
+```bash
+python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --layout devsecops --dry-run
+python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --layout devsecops --only nexus,sonarqube
+```
+
+Or by hand, with `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
 A secret value goes in from stdin (`field=-`, typed or piped, one per command)
 or from a file (`field=@path`), never as an argument, where the shell history
 and the process list would keep it. For example:
