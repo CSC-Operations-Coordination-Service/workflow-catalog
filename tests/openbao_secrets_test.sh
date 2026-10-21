@@ -28,10 +28,19 @@ check "action logs in as <role>-release on tag builds" "grep -q \"REF_TYPE === '
 check "the ocs-layout steps run only without tools" "[ \"\$(grep -c \"if: inputs.tools == ''\\$\" '$ACT')\" = 2 ] && grep -q \"if: inputs.tools == '' && steps.login.outcome == 'failure'\" '$ACT'"
 check "action has a required-field list per tool (behaviour: tools test)" "grep -q 'const REQUIRED = {' '$ACT'"
 check "a failed ocs read lists the ocs/ci paths it needed" "grep -q 'paths=\"\$paths ocs/ci/shared/\$n\"' '$ACT'"
-# csc-ocs-ansible's scripts/ci-secrets writes devsecops/ci/<kind>/<tool> with
-# --layout devsecops: the operator's message names it, and nothing still says
-# it does not write this layout.
-check "the devsecops message names ci_secrets.py --layout devsecops as the writer" "grep 'const HOWTO' '$ACT' | grep -q -- 'scripts/ci-secrets/ci_secrets.py .*--layout devsecops' && ! grep -q 'does not write this layout' '$ACT' && ! grep -q 'until csc-ocs-ansible' '$ACT'"
+# The signing key has a login role of its own (behaviour: tools test).
+check "action logs in as <role>-sign when tools is cosign alone" "grep -q \"const signing = tools.length === 1 && tools\\[0\\] === 'cosign';\" '$ACT' && grep -q -- '-sign\`' '$ACT'"
+# The catalog is public: its messages point at the platform repository's OpenBao
+# configuration, never at its files or its operations.
+check "action messages ask whether OpenBao is sealed, and point at the platform's configuration, without detail" "[ \"\$(grep -c 'Check, in order: is OpenBao SEALED? Does this job' '$ACT')\" = 2 ] && grep -q \"Its policies are in the platform repository's OpenBao configuration.\\\`);\" '$ACT'"
+# The platform repository's CI secrets script writes devsecops/ci/<kind>/<tool>
+# (its devsecops layout): the operator's message names it, by what it is, not
+# by its path, and nothing still says it does not write this layout.
+check "the devsecops message names the platform's CI secrets script as the writer" "grep 'const HOWTO' '$ACT' | grep -q \"the platform repository's CI secrets script (devsecops layout, component \\\${tool}\" && ! grep -q 'does not write this layout' '$ACT'"
+# Nor does any text of the action name the private platform repository or its
+# paths, and no catalog text names a real CI role (the public form is ci-<repo>).
+check "the action names no path of the private platform repository" "! grep -Eq 'csc-ocs-ansible|scripts/ci-secrets|ci_secrets\\.py' '$ACT'"
+check "no workflow, action or doc names a real CI role" "! grep -rEq 'ci-ocs-' '$ROOT/.github' '$ROOT/docs' '$ROOT/README.md'"
 
 # --- the workflows
 # Reads of a managed value that are NOT in the guarded form
@@ -210,7 +219,80 @@ EOF"
     check "[$sh] refuses a double, leading or trailing space" "! step_ok openbao 'nexus  sonarqube' && ! step_ok openbao ' nexus' && ! step_ok openbao 'nexus '"
     check "[$sh] refuses a capitalised name, and a glob" "! step_ok openbao 'Nexus' && ! step_ok openbao 'nex*'"
     check "[$sh]   ...and shows the list it got on one line, a newline as \\n" shows_escaped
+    # Signing in openbao mode: cosign listed, a tag build, environment prod.
+    # sign_ok <source> <tools> <sign-image> <release> <ref_type> <environment>,
+    # as docker-build.yml passes them.
+    sign_ok()  { in_sh "$sh" -e "$tmp/check.sh" SECRETS_SOURCE="$1" OPENBAO_TOOLS="$2" SIGN_IMAGE="$3" RELEASE="$4" REF_TYPE="$5" ENVIRONMENT="$6" >/dev/null 2>&1; }
+    sign_err() { in_sh "$sh" -e "$tmp/check.sh" SECRETS_SOURCE="$1" OPENBAO_TOOLS="$2" SIGN_IMAGE="$3" RELEASE="$4" REF_TYPE="$5" ENVIRONMENT="$6" 2>&1 || true; }
+    check "[$sh] refuses sign-image on a release build in openbao mode without cosign, naming the rule" \
+      "! sign_ok openbao nexus true true tag prod && sign_err openbao nexus true true tag prod | grep -qF \"::error::sign-image on a release build in openbao mode needs cosign in openbao-tools (got 'nexus'). Signing in openbao mode reads the key with the <openbao-role>-sign role\""
+    check "[$sh]   ...also with openbao-tools empty (no ocs/ci/shared fallback for the key)" "! sign_ok openbao '' true true tag prod && sign_err openbao '' true true tag prod | grep -q 'needs cosign in openbao-tools'"
+    check "[$sh] accepts signing in openbao mode with cosign listed, alone or with others, on a tag build with environment prod" "sign_ok openbao cosign true true tag prod && sign_ok openbao 'nexus cosign dockerhub' true true tag prod"
+    check "[$sh] refuses signing in openbao mode on a build that is not a tag, naming it" \
+      "! sign_ok openbao cosign true true branch prod && sign_err openbao cosign true true branch prod | grep -qF \"signs tag builds only, and this is a 'branch' build\""
+    # The Cosign read is right before the signature, after the push: with nexus
+    # not in openbao-tools it is the job's first read that checks environment,
+    # so an environment other than prod must stop the job here, before the build.
+    check "[$sh] refuses signing in openbao mode on a tag build with environment dev (the default), naming the rule" \
+      "! sign_ok openbao cosign true true tag dev && sign_err openbao cosign true true tag dev | grep -qF \"::error::sign-image on a release build in openbao mode needs the image build's environment to be prod (got 'dev')\""
+    check "[$sh]   ...also with environment empty, capitalised or unset" \
+      "! sign_ok openbao cosign true true tag '' && ! sign_ok openbao cosign true true tag Prod && ! in_sh $sh -e '$tmp/check.sh' SECRETS_SOURCE=openbao OPENBAO_TOOLS=cosign SIGN_IMAGE=true RELEASE=true REF_TYPE=tag >/dev/null 2>&1"
+    check "[$sh]   ...and shows the environment it got on one line, a newline as \\n" "sign_err openbao cosign true true tag \$'prod\\n' | grep -qF \"(got 'prod\\n')\""
+    check "[$sh] signing without release, or a release without signing, needs no cosign and no environment prod" "sign_ok openbao nexus true false branch dev && sign_ok openbao nexus false true tag dev && sign_ok openbao '' false true tag ''"
+    check "[$sh] github mode signs as before, without cosign, on any build and any environment" "sign_ok github '' true true tag dev && sign_ok github '' true true branch dev"
+    check "[$sh] a badly separated list is refused for its separator first" "sign_err openbao \$'nexus\\ncosign' true true tag prod | grep -q 'separated by single spaces' && ! sign_err openbao \$'nexus\\ncosign' true true tag prod | grep -q 'needs cosign'"
   done
+
+  # The Cosign read: right before the signing step, cosign alone, no ocs/ci/shared
+  # fallback; the key blanked right after, whatever happened. And the Check step
+  # gets what it needs to refuse signing without cosign.
+  docker_steps() {  # docker_steps <python body>: the docker job's steps as `steps`
+    python3 -c "import sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))['jobs']['docker']['steps']
+names = [s.get('name') for s in steps]
+$1" "$DOCKER"
+  }
+  check "docker-build.yml: the Cosign read is immediately before 'Sign image (Cosign)', the blanking step immediately after" "docker_steps \"
+r, g, c = (names.index(n) for n in ('Read Cosign secrets from OpenBao', 'Sign image (Cosign)', 'Clear the Cosign key from the job environment'))
+assert (r + 1, g + 1) == (g, c), (r, g, c)
+\""
+  check "docker-build.yml: the Cosign read passes tools: cosign alone, no shared, under the signing gate" "docker_steps \"
+read = steps[names.index('Read Cosign secrets from OpenBao')]
+w = read['with']
+assert 'openbao-secrets@' in read['uses'], read['uses']
+assert w['tools'] == 'cosign' and 'shared' not in w and 'repo' not in w, w
+assert read['if'] == \\\"inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release\\\", read['if']
+others = [s for s in steps if 'openbao-secrets' in s.get('uses', '') and s is not read]
+assert others and not any('cosign' in str(s.get('with', {})).lower() for s in others), others
+\""
+  check "docker-build.yml: no ocs/ci/shared fallback for the signing key remains" "! grep -q 'COSIGN_PRIVATE_KEY COSIGN_PASSWORD' '$DOCKER' && ! grep -q \"' cosign ')\" '$DOCKER'"
+  check "docker-build.yml: the blanking step runs if: always() under the signing gate, under sh" "docker_steps \"
+clear = steps[names.index('Clear the Cosign key from the job environment')]
+assert clear['if'] == \\\"\\\${{ always() && inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release }}\\\", clear['if']
+assert clear.get('shell') == 'sh', clear.get('shell')
+\""
+  docker_steps "print(steps[names.index('Clear the Cosign key from the job environment')]['run'], end='')" >"$tmp/clear.sh"
+  printf 'COSIGN_PRIVATE_KEY<<EOF_X\nnot-a-key\nEOF_X\n' >"$tmp/github_env"
+  check "docker-build.yml: the blanking step appends empty COSIGN_PRIVATE_KEY and COSIGN_PASSWORD to GITHUB_ENV" \
+    "env -i PATH=\"\$PATH\" GITHUB_ENV='$tmp/github_env' sh -e '$tmp/clear.sh' >/dev/null && [ \"\$(tail -n 2 '$tmp/github_env')\" = \"\$(printf 'COSIGN_PRIVATE_KEY=\\nCOSIGN_PASSWORD=')\" ]"
+  check_env() {  # check_env <workflow> <job> <SIGN_IMAGE> <RELEASE> <ENVIRONMENT>: the Check step's env
+    python3 -c "import sys, yaml
+f, job, sign, release, environment = sys.argv[1:]
+step = [s for s in yaml.safe_load(open(f))['jobs'][job]['steps'] if s.get('name') == 'Check secrets-source and openbao-tools'][0]
+e = step['env']
+got = (e.get('SIGN_IMAGE'), e.get('RELEASE'), e.get('REF_TYPE'), e.get('ENVIRONMENT'))
+assert got == (sign, release, '\${{ github.ref_type }}', environment), got" "$@"
+  }
+  check "Check step env: docker-build.yml passes sign-image, release, the ref type and environment" \
+    "check_env '$DOCKER' docker '\${{ inputs.sign-image }}' '\${{ inputs.release }}' '\${{ inputs.environment }}'"
+  check "Check step env: node-workflow.yml passes its image build's sign-image, docker-release and docker-environment" \
+    "check_env '$NODE' node-ci '\${{ inputs.build-image && inputs.sign-image }}' '\${{ inputs.docker-release }}' '\${{ inputs.docker-environment }}'"
+  check "Check step env: node-workflow.yml's docker-environment is the environment its image build gets" \
+    "python3 -c \"import sys, yaml; w = yaml.safe_load(open(sys.argv[1]))['jobs']['docker']['with']; assert w['environment'] == '\\\${{ inputs.docker-environment }}', w['environment']\" '$NODE'"
+  check "Check step env: python-ci.yml signs nothing, so passes none of the signing variables" \
+    "python3 -c \"import sys, yaml
+step = [s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['test']['steps'] if s.get('name') == 'Check secrets-source and openbao-tools'][0]
+assert set(step['env']) == {'SECRETS_SOURCE', 'OPENBAO_TOOLS'}, sorted(step['env'])\" '$PY'"
 
   # python-ci's SonarQube preflight names the OpenBao path of an empty value.
   run_of "$PY" sonarqube "Check SonarQube URL and token" >"$tmp/sonar.sh"
@@ -254,6 +336,8 @@ check "docker-build.yml: every read passes environment for the build-kind check"
 check "python-ci.yml: runs-on is an input, default self-hosted" "grep -A4 '^      runs-on:' '$PY' | grep -q 'default: self-hosted' && ! grep -q '^    runs-on: self-hosted' '$PY'"
 check "python-ci.yml: container jobs join the openbao network only in openbao mode" "[ \"\$(grep -c -- \"secrets-source == 'openbao' && '.*--network ocs_openbao\" '$PY')\" = 3 ]"
 check "node-workflow.yml passes openbao-tools to docker-build" "grep -q 'openbao-tools: \${{ inputs.openbao-tools }}' '$NODE'"
+check "node-workflow.yml passes sign-image to docker-build, and signs nothing itself" "grep -q 'sign-image: \${{ inputs.sign-image }}' '$NODE' && ! grep -q 'cosign-sign' '$NODE'"
+check "node-workflow.yml and python-ci.yml read no Cosign value from OpenBao" "! grep -q \"' cosign '\" '$NODE' '$PY' && ! grep -q 'COSIGN_' '$PY'"
 check "docker-build.yml: runs-on is an input, default self-hosted" "grep -A4 '^      runs-on:' '$DOCKER' | grep -q 'default: self-hosted' && ! grep -q '^    runs-on: self-hosted' '$DOCKER'"
 check "node-workflow.yml: no job hardcodes self-hosted" "! grep -q '^    runs-on: self-hosted' '$NODE'"
 check "node-workflow.yml: container job joins the openbao network only in openbao mode" "grep -q -- '--network ocs_openbao' '$NODE' && grep -B2 -- '--network ocs_openbao' '$NODE' | grep -q 'secrets-source'"

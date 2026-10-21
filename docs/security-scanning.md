@@ -296,7 +296,7 @@ logins already established for the push, and is **gated to release builds**
 
 | Input | Default | Purpose |
 | --- | --- | --- |
-| `sign-image` | `false` | Sign the pushed image digest with Cosign. Release builds only; needs the two Cosign secrets. |
+| `sign-image` | `false` | Sign the pushed image digest with Cosign. Release builds only; needs the two Cosign secrets, or with `secrets-source: openbao`, `cosign` in `openbao-tools`, a tag build and `environment: prod` ([the signing key](openbao-secrets.md#the-signing-key-cosign)). |
 
 Signing needs two secrets, `COSIGN_PRIVATE_KEY` and `COSIGN_PASSWORD` (see
 [.github/SECRETS.md](../.github/SECRETS.md)) — unlike the scanners, which need

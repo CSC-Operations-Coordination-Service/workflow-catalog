@@ -10,18 +10,24 @@ const [scriptFile, actionDir, keyFile, certFile] = process.argv.slice(2);
 const script = fs.readFileSync(scriptFile, 'utf8');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
-// --- mock OpenBao: roles ci-x and ci-x-release, a few secrets ----------------
+// --- mock OpenBao: roles ci-x, ci-x-release and ci-x-sign, a few secrets -----
+// The signing key is held by ci-x-sign only, as the platform's policies hold it
+// (the release role is denied it); the mock answers 403 for a path another role
+// holds. Every value here is a dummy.
 const SECRETS = {
   'ci-x': {
     'devsecops/data/ci/dev/nexus': { host: 'nexus.ocs.local', port: 8082, username: 'dev-artifact', password: 'dev-pw', docker_registry: 'registry-dev.ocs-registry.local', url: 'http://ignored' },
-    'devsecops/data/ci/dev/cosign': { private_key: '-----BEGIN KEY-----\nAAAA\nBBBB\n-----END KEY-----', password: 'cosign-pw' },
     'ocs/data/ci/repo-x/EXTRA': { value: 'extra-value' },
   },
   'ci-x-release': {
     'devsecops/data/ci/prod/nexus': { host: 'nexus.ocs.local', port: '8084', username: 'prod-artifact', password: 'prod-pw', docker_registry: 'registry.ocs-registry.local', goproxy: 'http://goproxy.ocs.local' },
   },
+  'ci-x-sign': {
+    'devsecops/data/ci/prod/cosign': { private_key: '-----BEGIN KEY-----\nAAAA\nBBBB\n-----END KEY-----', password: 'cosign-pw' },
+  },
 };
 const requests = [];
+const logins = [];   // the role of each login request, in order
 const server = https.createServer({ key: fs.readFileSync(keyFile), cert: fs.readFileSync(certFile) }, (req, res) => {
   let body = '';
   req.on('data', (c) => { body += c; });
@@ -30,6 +36,7 @@ const server = https.createServer({ key: fs.readFileSync(keyFile), cert: fs.read
     const send = (status, json) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(json)); };
     if (req.method === 'POST' && req.url === '/v1/auth/jwt/login') {
       const { role, jwt } = JSON.parse(body);
+      logins.push(role);
       if (jwt !== 'the-jwt' || !(role in SECRETS)) return send(400, { errors: [`role "${role}" could not be found`] });
       return send(200, { auth: { client_token: `tok-${role}` } });
     }
@@ -63,6 +70,7 @@ async function run(envOverrides, { idToken = true } = {}) {
     info: () => {},
   };
   requests.length = 0;
+  logins.length = 0;
   try {
     await new AsyncFunction('core', 'require', script)(core, require);
   } catch (e) {
@@ -72,6 +80,7 @@ async function run(envOverrides, { idToken = true } = {}) {
     Object.assign(process.env, saved);
   }
   out.requests = [...requests];
+  out.logins = [...logins];
   return out;
 }
 
@@ -96,7 +105,7 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
 
   let o = await run({ OPENBAO_TOOLS: 'nexus' });
   check('branch build: no error', o.error === null);
-  check('branch build: logs in as the base role', o.requests.includes('POST /v1/auth/jwt/login') && o.exported.NEXUS_USERNAME === 'dev-artifact');
+  check('branch build: logs in as the base role', o.logins.join() === 'ci-x' && o.exported.NEXUS_USERNAME === 'dev-artifact');
   check('branch build: reads devsecops/ci/dev/nexus', o.requests.includes('GET /v1/devsecops/data/ci/dev/nexus'));
   check('branch build: exports the mapped names, port as a string', o.exported.NEXUS_HOST === 'nexus.ocs.local' && o.exported.NEXUS_PORT === '8082' && o.exported.NEXUS_PASSWORD === 'dev-pw');
   check('branch build: docker_registry -> NEXUS_DOCKER_REGISTRY_DEV only', o.exported.NEXUS_DOCKER_REGISTRY_DEV === 'registry-dev.ocs-registry.local' && !('NEXUS_DOCKER_REGISTRY_PROD' in o.exported));
@@ -107,7 +116,7 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
 
   o = await run({ OPENBAO_TOOLS: 'nexus', REF_TYPE: 'tag', REF_NAME: 'v1.2.3', OPENBAO_ENVIRONMENT: 'prod' });
   check('tag build: no error', o.error === null);
-  check('tag build: logs in as <role>-release and reads prod', o.exported.NEXUS_USERNAME === 'prod-artifact' && o.requests.includes('GET /v1/devsecops/data/ci/prod/nexus'));
+  check('tag build: logs in as <role>-release and reads prod', o.logins.join() === 'ci-x-release' && o.exported.NEXUS_USERNAME === 'prod-artifact' && o.requests.includes('GET /v1/devsecops/data/ci/prod/nexus'));
   check('tag build: docker_registry -> NEXUS_DOCKER_REGISTRY_PROD only', o.exported.NEXUS_DOCKER_REGISTRY_PROD === 'registry.ocs-registry.local' && !('NEXUS_DOCKER_REGISTRY_DEV' in o.exported));
   check('goproxy, when stored, is exported as GOPROXY', o.exported.GOPROXY === 'http://goproxy.ocs.local');
 
@@ -156,9 +165,47 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
   o = await run({ OPENBAO_TOOLS: 'nexus' }, { idToken: false });
   check('no OIDC token stops, naming id-token: write', /id-token: write/.test(o.error || ''));
 
-  o = await run({ OPENBAO_TOOLS: 'cosign' });
-  check('a multi-line value is exported whole', o.exported.COSIGN_PRIVATE_KEY.split('\n').length === 4);
+  // The signing key: read alone, on tag builds only, with <role>-sign.
+  const TAG = { REF_TYPE: 'tag', REF_NAME: 'v1.2.3', OPENBAO_ENVIRONMENT: 'prod' };
+  o = await run({ OPENBAO_TOOLS: 'cosign', ...TAG });
+  check('cosign alone on a tag build: no error', o.error === null);
+  check('  ...logs in as <role>-sign, and only as that', o.logins.join() === 'ci-x-sign');
+  check('  ...reads devsecops/ci/prod/cosign, nothing else', o.requests.filter((r) => r.startsWith('GET ')).join() === 'GET /v1/devsecops/data/ci/prod/cosign');
+  check('  ...exports COSIGN_PRIVATE_KEY and COSIGN_PASSWORD only', Object.keys(o.exported).sort().join() === 'COSIGN_PASSWORD,COSIGN_PRIVATE_KEY');
+  check('a multi-line value is exported whole', (o.exported.COSIGN_PRIVATE_KEY || '').split('\n').length === 4);
   check('a multi-line value is masked whole and line by line', o.masked.has(o.exported.COSIGN_PRIVATE_KEY) && o.masked.has('AAAA') && o.masked.has('BBBB'));
+  check('  ...and the -sign token is masked', o.masked.has('tok-ci-x-sign'));
+
+  o = await run({ OPENBAO_TOOLS: 'cosign', REF_TYPE: 'tag', REF_NAME: 'v1.2.3' });
+  check('cosign alone on a tag build without environment: <role>-sign too', o.error === null && o.logins.join() === 'ci-x-sign' && 'COSIGN_PRIVATE_KEY' in o.exported);
+
+  o = await run({ OPENBAO_TOOLS: 'cosign cosign', ...TAG });
+  check('cosign named twice is cosign alone', o.error === null && o.logins.join() === 'ci-x-sign');
+
+  o = await run({ OPENBAO_TOOLS: 'cosign nexus', ...TAG });
+  check('cosign with another tool stops, naming the rule, before any request', /cosign is read alone, with the role 'ci-x-sign'.*got tools 'cosign nexus'/.test(o.error || '') && o.requests.length === 0);
+  o = await run({ OPENBAO_TOOLS: 'nexus cosign', ...TAG });
+  check('  ...whatever the order', /cosign is read alone/.test(o.error || '') && o.requests.length === 0);
+  o = await run({ OPENBAO_TOOLS: 'nexus cosign' });
+  check('  ...and on a branch build too', /cosign is read alone/.test(o.error || '') && o.requests.length === 0);
+
+  o = await run({ OPENBAO_TOOLS: 'cosign', OPENBAO_REPO: 'EXTRA', ...TAG });
+  check('cosign with repo names stops, before any request', /cosign is read alone.*got repo 'EXTRA'/.test(o.error || '') && o.requests.length === 0);
+
+  o = await run({ OPENBAO_TOOLS: 'cosign' });
+  check('cosign on a branch build stops, naming the rule, before any request', /cosign is read on tag builds only, and this is a branch build of 'develop'/.test(o.error || '') && o.requests.length === 0 && Object.keys(o.exported).length === 0);
+  o = await run({ OPENBAO_TOOLS: 'cosign', OPENBAO_ENVIRONMENT: 'dev' });
+  check('  ...also with environment: dev', /cosign is read on tag builds only/.test(o.error || '') && o.requests.length === 0);
+
+  o = await run({ OPENBAO_TOOLS: 'nexus', ...TAG });
+  check('nexus on a tag build still logs in as <role>-release, never -sign', o.error === null && o.logins.join() === 'ci-x-release');
+
+  o = await run({ OPENBAO_TOOLS: 'cosign', OPENBAO_ROLE: 'ci-nobody', ...TAG });
+  check('a refused -sign login names the role and its bindings (repository, tag, the catalog\'s docker-build.yml)', /login as role 'ci-nobody-sign' failed.*bound to org\/repo-x, to ref_type tag and to the jobs of the catalog's docker-build\.yml \(claim job_workflow_ref/.test(o.error || ''));
+  check('  ...and asks first whether OpenBao is sealed, with no operational detail', /Check, in order: is OpenBao SEALED\? Does this job/.test(o.error || ''));
+  check('  ...and says the nested-call binding (job_workflow_ref naming docker-build.yml) is not confirmed yet', /binding assumes the token's job_workflow_ref names docker-build\.yml, which is not confirmed yet: see docs\/openbao-secrets\.md/.test(o.error || ''));
+  o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_ROLE: 'ci-nobody', ...TAG });
+  check('a refused -release login does not mention job_workflow_ref', /login as role 'ci-nobody-release' failed/.test(o.error || '') && !/job_workflow_ref/.test(o.error || ''));
 
   o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_REPO: 'EXTRA' });
   check('repo names are read from ocs/ci/<repo> with the same login', o.error === null && o.exported.EXTRA === 'extra-value' && o.masked.has('extra-value'));

@@ -10,7 +10,8 @@ name: Docker build (reusable)
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
 #   COSIGN_PRIVATE_KEY, COSIGN_PASSWORD (only when sign-image: true, release builds)
 # or, with secrets-source: openbao, the same values from OpenBao only, never
-# from these secrets (docs/openbao-secrets.md).
+# from these secrets (docs/openbao-secrets.md). In that mode the signing key
+# comes from the devsecops layout only: openbao-tools must list cosign.
 
 on:
   workflow_call:
@@ -207,7 +208,14 @@ on:
         type: boolean
         default: true
       sign-image:
-        description: "Sign the pushed image digest with Cosign (key-based). Needs COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Release builds only."
+        description: >
+          Sign the pushed image digest with Cosign (key-based). Release builds
+          only. Needs the COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets or, with
+          secrets-source: openbao, cosign in openbao-tools: the key is then read
+          alone, right before the signature, with the <openbao-role>-sign role
+          (docs/openbao-secrets.md). In openbao mode it signs tag builds with
+          environment prod only; without cosign listed, on another build or
+          with another environment, the job stops before anything is built.
         required: false
         type: boolean
         default: false
@@ -239,7 +247,7 @@ on:
         type: string
         default: "https://openbao:8200"
       openbao-role:
-        description: "OpenBao JWT role of this repository, e.g. ci-ocs-operator-app (secrets-source: openbao)"
+        description: "OpenBao JWT role of this repository, ci-<repo> (secrets-source: openbao)"
         required: false
         type: string
         default: ""
@@ -247,12 +255,12 @@ on:
         description: >
           Tools whose values come from the devsecops layout
           (devsecops/ci/<dev|prod>/<tool>) instead of ocs/ci/shared, separated by
-          single spaces on one line, e.g. "nexus dependency-track"; an unknown
-          name or any other separator stops the job. A tool not listed keeps the
-          ocs layout. Tag builds read prod and log in as <openbao-role>-release;
-          `environment` must then be prod, and dev on any other build (the read
-          stops the job otherwise). Cosign is read on release builds with
-          sign-image only. Only with secrets-source: openbao.
+          single spaces on one line, e.g. "nexus cosign"; an unknown name or any
+          other separator stops the job. A tool not listed keeps the ocs layout.
+          Tag builds read prod and log in as <openbao-role>-release, cosign alone
+          as <openbao-role>-sign (required with sign-image on a release build);
+          `environment` must then be prod, and dev on any other build, or the job
+          stops (before the build when it signs). Only with secrets-source: openbao.
         required: false
         type: string
         default: ""
@@ -322,11 +330,24 @@ jobs:
       # misspelled tool, or a list split by newlines, tabs or commas, for no
       # tool at all: the read would quietly keep the ocs layout, out of reach of
       # the action's own check for unknown tools. Refuse both here.
+      # And signing in openbao mode without cosign in openbao-tools, on a
+      # build that is not a tag, or with an environment other than prod: the
+      # key is read from the devsecops layout only, with the <openbao-role>-sign
+      # role (bound to tag builds), in "Read Cosign secrets from OpenBao", and
+      # the action refuses a tag build whose environment is not prod. That read
+      # sits right before the signature, and with nexus not in openbao-tools it
+      # is the job's first read that checks the environment. Refused here,
+      # before anything is built, rather than at the end of the job with an
+      # image pushed unsigned.
       - name: Check secrets-source and openbao-tools
         shell: sh
         env:
           SECRETS_SOURCE: ${{ inputs.secrets-source }}
           OPENBAO_TOOLS: ${{ inputs.openbao-tools }}
+          SIGN_IMAGE: ${{ inputs.sign-image }}
+          RELEASE: ${{ inputs.release }}
+          REF_TYPE: ${{ github.ref_type }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -eu
           set -f
@@ -340,12 +361,13 @@ jobs:
               printf "::error::secrets-source must be 'github' (the default) or 'openbao', got '%s'.\n" "$(shown "$SECRETS_SOURCE")"
               exit 1 ;;
           esac
-          if [ "$SECRETS_SOURCE" != openbao ] || [ -z "$OPENBAO_TOOLS" ]; then
+          if [ "$SECRETS_SOURCE" != openbao ]; then
             echo "secrets-source: $SECRETS_SOURCE"
             exit 0
           fi
           # One line, one space between names: the only form the matchers see.
           # The letters are spelled out: in some locales a-z takes in capitals.
+          # An empty list passes both checks.
           case $OPENBAO_TOOLS in
             ' '* | *' ' | *'  '* | *[!abcdefghijklmnopqrstuvwxyz\ -]*)
               printf "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got '%s'). Known: %s.\n" "$(shown "$OPENBAO_TOOLS")" "$known"
@@ -357,10 +379,39 @@ jobs:
               *) printf "::error::Unknown tool '%s' in openbao-tools. Known: %s.\n" "$t" "$known"; exit 1 ;;
             esac
           done
-          echo "secrets-source: openbao, openbao-tools: $OPENBAO_TOOLS"
+          # Signing in openbao mode reads the key from the devsecops layout only,
+          # alone, with the <openbao-role>-sign role, right before the signing
+          # step: the ocs/ci/shared layout never serves it, the role is bound to
+          # tag builds, and the action refuses a tag build whose environment is
+          # not prod (a tag build reads prod values only). All three refused
+          # here, before anything is built, not at the signing step with the
+          # image already pushed: with nexus not in openbao-tools, the Cosign
+          # read is the first read that checks the environment. SIGN_IMAGE,
+          # RELEASE, REF_TYPE and ENVIRONMENT are set where an image is signed
+          # (docker-build.yml, and node-workflow.yml for its image build), unset
+          # elsewhere.
+          if [ "${SIGN_IMAGE:-false}" = true ] && [ "${RELEASE:-false}" = true ]; then
+            case " $OPENBAO_TOOLS " in
+              *" cosign "*) ;;
+              *)
+                printf "::error::sign-image on a release build in openbao mode needs cosign in openbao-tools (got '%s'). Signing in openbao mode reads the key with the <openbao-role>-sign role, from the devsecops layout only, right before the signing step; ocs/ci/shared does not serve it. Add cosign to openbao-tools.\n" "$OPENBAO_TOOLS"
+                exit 1 ;;
+            esac
+            if [ "${REF_TYPE:-}" != tag ]; then
+              printf "::error::sign-image on a release build in openbao mode signs tag builds only, and this is a '%s' build: the <openbao-role>-sign role that reads the key is bound to tag builds. Push a version tag, or turn off sign-image or release for this build.\n" "${REF_TYPE:-}"
+              exit 1
+            fi
+            if [ "${ENVIRONMENT:-}" != prod ]; then
+              printf "::error::sign-image on a release build in openbao mode needs the image build's environment to be prod (got '%s'): it signs tag builds only, a tag build reads prod values only, and the Cosign read, right before the signature, would refuse any other environment after the image is pushed. Set environment: prod (docker-environment: prod for node-workflow.yml).\n" "$(shown "${ENVIRONMENT:-}")"
+              exit 1
+            fi
+          fi
+          echo "secrets-source: openbao, openbao-tools: ${OPENBAO_TOOLS:-none}"
 
       # Each read sets exactly one of tools / shared: the devsecops layout when the
       # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
+      # The one exception is the Cosign read, which is not here: it sits right
+      # before "Sign image (Cosign)" and reads the devsecops layout only.
       # In the devsecops layout a non-tag build gets only NEXUS_DOCKER_REGISTRY_DEV
       # and a tag build only _PROD; `environment` makes the action stop a build
       # whose environment disagrees, before "Resolve Nexus registry" would.
@@ -392,19 +443,6 @@ jobs:
           role: ${{ inputs.openbao-role }}
           tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'dependency-track' || '' }}
           shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'DEPENDENCYTRACK_URL DEPENDENCYTRACK_API_KEY' || '' }}
-          environment: ${{ inputs.environment }}
-
-      # Gated exactly like "Sign image (Cosign)", its only consumer: a branch
-      # build never signs, so it must not read the signing key either (in the
-      # devsecops layout it would need one in devsecops/ci/dev, or fail).
-      - name: Read Cosign secrets from OpenBao
-        if: inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
-        with:
-          openbao-url: ${{ inputs.openbao-url }}
-          role: ${{ inputs.openbao-role }}
-          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' cosign ') && 'cosign' || '' }}
-          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' cosign ') && 'COSIGN_PRIVATE_KEY COSIGN_PASSWORD' || '' }}
           environment: ${{ inputs.environment }}
 
       - name: Download artifact
@@ -959,8 +997,47 @@ jobs:
       # the image was built by this CI and has not been tampered with:
       #   cosign verify --key cosign.pub <registry>/<image>@<digest>
       # Gated to release builds; reuses the registry logins established above.
-      # Needs the COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets. Language-agnostic.
+      # Needs the COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets, or in openbao
+      # mode cosign in openbao-tools. Language-agnostic.
       # -----------------------------------------------------------------------
+      # In openbao mode the key is read here, immediately before its only
+      # consumer, and not with the other reads at the start of the job: no
+      # step before the signature (the build, Syft, Grype, Dockle and their
+      # third-party actions) ever has it in its environment, and a build that
+      # fails a gate never reads it. It is read alone (tools: cosign), so the
+      # action logs in as <openbao-role>-sign, a role that reads the key and
+      # nothing else. Why a role of its own: an audit found that
+      # <openbao-role>-release, held by every job of a tag build, could read
+      # the key, and any step of a job that runs npm ci, tox or a project's
+      # build can request the job's OIDC token itself; a malicious dependency
+      # could log in as -release and read the key in a job that never signs.
+      # The platform repository's OpenBao configuration now denies the key to
+      # -release and binds -sign to the repository, to ref_type tag and to the
+      # jobs of this workflow (claim job_workflow_ref). When node-workflow.yml
+      # calls this workflow, the binding holds only if the claim names the
+      # workflow that defines the job (this one), not the outer one. That is
+      # an assumption, not verified yet: GitHub documents the claim for one
+      # level of reusable workflow only. Confirm it on the first tag build that
+      # signs through node-workflow.yml (docs/openbao-secrets.md). If the claim
+      # names node-workflow.yml instead, the -sign login is refused there, and
+      # such callers cannot sign in openbao mode until that is settled. The
+      # other steps of this job could still request the token
+      # themselves, but they run only actions the catalog pins, never a
+      # project's dependencies (the image's RUN steps run inside BuildKit,
+      # without the job's token). No ocs/ci/shared fallback: every build's role reads that
+      # layout, so it must never serve the key; "Check secrets-source and
+      # openbao-tools" refuses to sign without cosign in openbao-tools.
+      # Gated exactly like "Sign image (Cosign)": a build that does not sign
+      # never reads the key (and the action refuses cosign on a non-tag build).
+      - name: Read Cosign secrets from OpenBao
+        if: inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          tools: cosign
+          environment: ${{ inputs.environment }}
+
       - name: Sign image (Cosign)
         if: ${{ inputs.sign-image && inputs.release }}
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/cosign-sign@develop
@@ -973,3 +1050,16 @@ jobs:
           # so only the Nexus reference is signed over HTTP; the GHCR and Docker
           # Hub references in the same list keep TLS.
           insecure-registries: ${{ inputs.insecure-registry && env.NEXUS_DOCKER_REGISTRY || '' }}
+
+      # The read above exports the key and its password to GITHUB_ENV, where
+      # every later step and every post step (checkout's cleanup, the
+      # docker/login-action logouts, setup-buildx's and build-push-action's
+      # post steps) would see them. Later steps and post steps must not see
+      # the key: blank both as soon as the signature is made, and also when it
+      # failed or the job was cancelled (always()). Same gate as the read.
+      - name: Clear the Cosign key from the job environment
+        if: ${{ always() && inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release }}
+        shell: sh
+        run: |
+          printf 'COSIGN_PRIVATE_KEY=\nCOSIGN_PASSWORD=\n' >> "$GITHUB_ENV"
+          echo "COSIGN_PRIVATE_KEY and COSIGN_PASSWORD are empty for the rest of the job."

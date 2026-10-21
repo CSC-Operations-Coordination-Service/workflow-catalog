@@ -19,13 +19,22 @@ description: >
 
   devsecops layout (kv-v2 mount `devsecops`), one secret per tool, fields
   inside: devsecops/ci/<kind>/<tool>, where kind is `prod` on a tag build and
-  `dev` on every other build. A tag build logs in as `<role>-release`, any
-  other build as `<role>`: callers pass the base role name only. Each field is
-  exported under the name the workflows already read (map in the step below),
-  masked. Every field but nexus's `goproxy` is required: a secret that lacks
-  one, or holds it empty, stops the job before anything is exported. `repo`
-  names are read from the ocs layout with the same login, and an absent,
-  empty or blank `value` stops the job the same way.
+  `dev` on every other build. Callers pass the base role name only; the login
+  role follows the build and the tools:
+    `<role>`          any build that is not a tag
+    `<role>-release`  a tag build
+    `<role>-sign`     a tag build that reads `cosign`, and nothing else
+  The signing key is read alone, with a role of its own: `cosign` together
+  with another tool or with `repo` names, or on a build that is not a tag, is
+  refused before the login. The platform repository's OpenBao configuration
+  binds `<role>-sign` to the repository, to tag builds and to the jobs of the
+  catalog's docker-build.yml, so a job that installs or builds a project's
+  dependencies cannot log in as it.
+  Each field is exported under the name the workflows already read (map in
+  the step below), masked. Every field but nexus's `goproxy` is required: a
+  secret that lacks one, or holds it empty, stops the job before anything is
+  exported. `repo` names are read from the ocs layout with the same login,
+  and an absent, empty or blank `value` stops the job the same way.
 
   Runs on the containerized runner pool, where https://openbao:8200 resolves
   (the overlay `ocs_openbao`). A job with a `container:` is a sibling container
@@ -37,8 +46,9 @@ inputs:
     required: true
   role:
     description: >
-      JWT role of this repository, e.g. ci-ocs-operator-app. With `tools`, the
-      base name: tag builds log in as `<role>-release`.
+      JWT role of this repository, `ci-<repo>`. With `tools`, the
+      base name: tag builds log in as `<role>-release`, or as `<role>-sign`
+      when `tools` is `cosign` alone.
     required: true
   shared:
     description: "Names under ocs/ci/shared, separated by spaces or newlines. Not with `tools`."
@@ -52,7 +62,8 @@ inputs:
     description: >
       Tools to read from the devsecops layout, separated by spaces or newlines:
       nexus, sonarqube, dependency-track, dockerhub, cosign. Empty = the ocs
-      layout (`shared` / `repo`), exactly as before.
+      layout (`shared` / `repo`), exactly as before. `cosign` is read alone
+      (no other tool, no `repo`), on tag builds only, as `<role>-sign`.
     required: false
     default: ""
   environment:
@@ -124,7 +135,7 @@ runs:
         REPO_NAME: ${{ github.event.repository.name }}
       run: |
         echo "::error::OpenBao login or secret read failed at ${{ inputs.openbao-url }} (role ${{ inputs.role }})."
-        echo "::error::Check, in order: is OpenBao SEALED (it is unsealed by hand after any restart)? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to ${{ github.repository }}? Do the secret names exist under ocs/ci?"
+        echo "::error::Check, in order: is OpenBao SEALED? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to ${{ github.repository }}? Do the secret names exist under ocs/ci?"
         # The paths, never the values: one path that no operator has stored
         # yet (for python-ci, ocs/ci/shared/SONAR_HOST_URL, say) fails the
         # whole read, and the list says where to look without opening the
@@ -173,15 +184,29 @@ runs:
 
           // Build kind: a version tag publishes prod artifacts, anything else dev.
           const kind = env.REF_TYPE === 'tag' ? 'prod' : 'dev';
-          const role = kind === 'prod' ? `${env.OPENBAO_ROLE}-release` : env.OPENBAO_ROLE;
+          const tools = words(env.OPENBAO_TOOLS);
+          // The login role. The signing key has one of its own, <role>-sign,
+          // read alone: <role>-release is held by every job of a tag build,
+          // including the ones that run npm ci, tox or a project's own build,
+          // and any step of such a job can request the job's OIDC token
+          // itself. A malicious dependency could then log in as -release and
+          // read the key, in a job that never signs. The platform repository's
+          // OpenBao configuration denies the key to -release and binds -sign to
+          // the repository, to ref_type tag and to the jobs of the catalog's
+          // docker-build.yml (claim job_workflow_ref), which reads cosign alone,
+          // right before its signing step.
+          const signing = tools.length === 1 && tools[0] === 'cosign';
+          const role = signing ? `${env.OPENBAO_ROLE}-sign`
+            : kind === 'prod' ? `${env.OPENBAO_ROLE}-release` : env.OPENBAO_ROLE;
 
-          // The contract with csc-ocs-ansible: field of
+          // The contract with the platform repository: field of
           // devsecops/ci/<kind>/<tool> -> variable the workflows read.
-          // An operator writes each secret, with csc-ocs-ansible's
-          // scripts/ci-secrets/ci_secrets.py --layout devsecops (dry run first),
-          // or by hand with `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
+          // An operator writes each secret, with the platform repository's CI
+          // secrets script (devsecops layout, dry run first), or by hand with
+          // `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
           // That script's paths and field names are this map and REQUIRED:
-          // change them together.
+          // change them together. The catalog is public: its texts name that
+          // repository's script, never its paths.
           const MAP = {
             nexus: {
               host: 'NEXUS_HOST', port: 'NEXUS_PORT',
@@ -210,21 +235,32 @@ runs:
           // a boolean, an object or null is not a value a workflow can use.
           const usable = (v) => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '');
           // How an operator fixes a missing secret or field: the script's
-          // components have the tool names of MAP, so --only <tool> fits. By
+          // components have the tool names of MAP, so the message names one. By
           // hand, values go in on stdin (`field=-`, typed or piped, one per
           // command) or from a file (`field=@path`), never as an argument,
           // where the shell history and the process list would keep them.
-          const HOWTO = (tool) => `An operator stores it with csc-ocs-ansible's scripts/ci-secrets/ci_secrets.py --env <credentials file> --layout devsecops --only ${tool} (with --dry-run first), or by hand: bao kv put -mount=devsecops ci/${kind}/${tool} <field>=... (bao kv patch to add a field), each secret field as <field>=- (stdin) or <field>=@<file>, never as an argument. A pipeline never writes it.`;
+          const HOWTO = (tool) => `An operator stores it with the platform repository's CI secrets script (devsecops layout, component ${tool}, dry run first), or by hand: bao kv put -mount=devsecops ci/${kind}/${tool} <field>=... (bao kv patch to add a field), each secret field as <field>=- (stdin) or <field>=@<file>, never as an argument. A pipeline never writes it.`;
 
           // --- refuse a bad request before talking to OpenBao. Object.hasOwn,
           // not `in`: 'constructor' is `in` every object.
-          const tools = words(env.OPENBAO_TOOLS);
           const unknown = tools.filter((t) => !Object.hasOwn(MAP, t));
           if (unknown.length) {
             throw new Error(`Unknown tool(s) in 'tools': ${unknown.join(', ')}. Known: ${Object.keys(MAP).join(', ')}.`);
           }
           if (words(env.OPENBAO_SHARED).length) {
             throw new Error("Pass either 'tools' (devsecops layout) or 'shared' (ocs/ci/shared), not both in one call.");
+          }
+          // cosign: one call of its own (the -sign role reads the key and
+          // nothing else, so a mixed call could only fail on a 403, after the
+          // login), and tag builds only (-sign is bound to ref_type tag).
+          if (tools.includes('cosign') && tools.length > 1) {
+            throw new Error(`cosign is read alone, with the role '${env.OPENBAO_ROLE}-sign', which reads the signing key and nothing else: got tools '${tools.join(' ')}'. Read the other tools in a call of their own.`);
+          }
+          if (tools.includes('cosign') && words(env.OPENBAO_REPO).length) {
+            throw new Error(`cosign is read alone, with the role '${env.OPENBAO_ROLE}-sign', which reads the signing key and nothing else: got repo '${words(env.OPENBAO_REPO).join(' ')}' as well. Read the repo names in a call of their own.`);
+          }
+          if (signing && kind !== 'prod') {
+            throw new Error(`cosign is read on tag builds only, and this is a ${env.REF_TYPE} build of '${env.REF_NAME}': the role '${env.OPENBAO_ROLE}-sign' is bound to ref_type tag. Only a tag build signs.`);
           }
           const want = env.OPENBAO_ENVIRONMENT;
           if (want && !['dev', 'prod'].includes(want)) {
@@ -262,7 +298,12 @@ runs:
             req.end();
           });
           const why = (r) => (r.json && Array.isArray(r.json.errors) && r.json.errors.length ? r.json.errors.join('; ') : `HTTP ${r.status}`);
-          const CHECKS = `Check, in order: is OpenBao SEALED (it is unsealed by hand after any restart)? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role '${role}' exist, bound to ${env.REPOSITORY}${kind === 'prod' ? ' and to ref_type tag' : ''}?`;
+          // What the role is bound to, as the platform repository's OpenBao
+          // configuration binds it: a login refused on a bound claim names it.
+          const bound = signing
+            ? `${env.REPOSITORY}, to ref_type tag and to the jobs of the catalog's docker-build.yml (claim job_workflow_ref; a job of any other workflow cannot log in as it)`
+            : `${env.REPOSITORY}${kind === 'prod' ? ' and to ref_type tag' : ''}`;
+          const CHECKS = `Check, in order: is OpenBao SEALED? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role '${role}' exist, bound to ${bound}?`;
 
           // --- login
           let jwt;
@@ -279,7 +320,11 @@ runs:
           }
           const token = login.json && login.json.auth && login.json.auth.client_token;
           if (login.status !== 200 || !token) {
-            throw new Error(`OpenBao login as role '${role}' failed: ${why(login)}. ${CHECKS}`);
+            // Not verified yet: that job_workflow_ref names docker-build.yml
+            // when another catalog workflow calls it. Say so where a refusal
+            // would show it.
+            const nested = signing ? " If docker-build.yml was called through another catalog workflow (node-workflow.yml), the binding assumes the token's job_workflow_ref names docker-build.yml, which is not confirmed yet: see docs/openbao-secrets.md in the catalog." : '';
+            throw new Error(`OpenBao login as role '${role}' failed: ${why(login)}. ${CHECKS}${nested}`);
           }
           core.setSecret(token);
 
@@ -293,7 +338,7 @@ runs:
               throw new Error(`Reading ${label} from OpenBao failed (${e.message}). ${CHECKS}`);
             }
             if (r.status === 404) throw new Error(`${label} does not exist in OpenBao. ${missing}`);
-            if (r.status === 403) throw new Error(`Role '${role}' may not read ${label} (${why(r)}). Its policies are in csc-ocs-ansible stacks/platform/openbao/openbao-config.yml.`);
+            if (r.status === 403) throw new Error(`Role '${role}' may not read ${label} (${why(r)}). Its policies are in the platform repository's OpenBao configuration.`);
             if (r.status !== 200 || !r.json || !r.json.data || !r.json.data.data) throw new Error(`Reading ${label} failed: ${why(r)}. ${CHECKS}`);
             return r.json.data.data;
           };
@@ -317,7 +362,7 @@ runs:
           }
           for (const name of words(env.OPENBAO_REPO)) {
             const label = `ocs/ci/${env.REPO_NAME}/${name}`;
-            const STORE = 'An operator stores it by hand: bao kv put -mount=ocs ci/<repo>/<name> value=- (stdin) or value=@<file>, never as an argument (csc-ocs-ansible scripts/ci-secrets writes no ocs/ci/<repo> secret). A pipeline never writes it.';
+            const STORE = "An operator stores it by hand: bao kv put -mount=ocs ci/<repo>/<name> value=- (stdin) or value=@<file>, never as an argument (the platform repository's CI secrets script writes no ocs/ci/<repo> secret). A pipeline never writes it.";
             const data = await read(`ocs/data/ci/${env.REPO_NAME}/${name}`, label, STORE);
             // The rule of a required field: a blank value would only resurface
             // later as an empty variable, far from its cause.

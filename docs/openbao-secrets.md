@@ -30,8 +30,8 @@ URL.
 | --- | --- | --- |
 | `secrets-source` | `github` | `openbao` reads the values from OpenBao. Any other value (`open-bao`, `OpenBao`, empty) stops the job at the step "Check secrets-source and openbao-tools", before any read |
 | `openbao-url` | `https://openbao:8200` | Reachable from the runner pool only (overlay `ocs_openbao`) |
-| `openbao-role` | — | The repository's JWT role, e.g. `ci-ocs-operator-app` |
-| `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), separated by single spaces on one line (`nexus sonarqube`). An unknown name, a comma, a tab or a newline stops the job at the step "Check secrets-source and openbao-tools". Empty: every value from `ocs/ci/shared`, as before |
+| `openbao-role` | — | The repository's JWT role, `ci-<repo>` (the base name: in the devsecops layout the action adds `-release` or `-sign` itself) |
+| `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), separated by single spaces on one line (`nexus sonarqube`). An unknown name, a comma, a tab or a newline stops the job at the step "Check secrets-source and openbao-tools". Empty: every value from `ocs/ci/shared`, as before. With `sign-image` on a `release` build, `cosign` is required, and so are a tag build and `environment: prod` ([the signing key](#the-signing-key-cosign)) |
 | `runs-on` | `self-hosted` | Use `containerized` (a single label; the input is a string, not a list) |
 
 Two things the **caller job** must do, because a reusable workflow cannot grant
@@ -55,7 +55,7 @@ jobs:
     with:
       runs-on: containerized
       secrets-source: openbao
-      openbao-role: ci-ocs-operator-app
+      openbao-role: ci-<repo>   # the repository's base role name
     secrets: inherit
 ```
 
@@ -93,7 +93,7 @@ without its value.
 | `docker-build.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `NEXUS_DOCKER_REGISTRY_DEV`, `NEXUS_DOCKER_REGISTRY_PROD` |
 | `docker-build.yml` | `push-to-dockerhub` | `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` |
 | `docker-build.yml` | `generate-sbom` | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` |
-| `docker-build.yml` | `sign-image` on a `release` build | `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` |
+| `docker-build.yml` | `sign-image` on a `release` build | none: the signing key comes from the devsecops layout only, with `cosign` in `openbao-tools` ([the signing key](#the-signing-key-cosign)) |
 | `python-ci.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `SONAR_TOKEN`, `SONAR_HOST_URL` |
 
 `python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`. csc-ocs-ansible's
@@ -121,17 +121,25 @@ kv-v2 mount `devsecops`, one secret per tool, its fields inside:
 | Path | Read by |
 | --- | --- |
 | `devsecops/ci/dev/<tool>` | `ci-<repo>`: every build that is not a tag |
-| `devsecops/ci/prod/<tool>` | `ci-<repo>-release`: tag builds only |
+| `devsecops/ci/prod/<tool>`, but `cosign` | `ci-<repo>-release`: tag builds only |
+| `devsecops/ci/prod/cosign` | `ci-<repo>-sign` only: tag builds, in a job of the catalog's `docker-build.yml` ([the signing key](#the-signing-key-cosign)) |
 
 The build kind decides both, from `github.ref_type`: a tag build reads `prod`
 and logs in as `<openbao-role>-release`, any other build reads `dev` and logs in
 as `<openbao-role>`. The caller passes the base role name only. So a branch build
-never holds the credentials that publish prod artifacts.
+never holds the credentials that publish prod artifacts. The signing key is the
+exception: it is read alone, as `<openbao-role>-sign`.
 
 `docker-build.yml`'s `environment` input must agree: `dev` on a branch build,
-`prod` on a tag build. A mismatch stops the job at the OpenBao read, with a
-message, before anything is built (a dev build gets no prod registry, and the
-reverse).
+`prod` on a tag build. The action refuses a mismatch, with a message, at any
+devsecops read (a dev build gets no prod registry, and the reverse). The reads
+at the start of the job come before anything is built, but they check the
+environment only for the tools listed in `openbao-tools`: with `nexus` not
+listed, the Nexus read uses the ocs layout and checks nothing. The Cosign read
+comes after the push. So when a build signs in openbao mode,
+"Check secrets-source and openbao-tools" refuses an `environment` other than
+`prod` itself, before anything is built. A build that does not sign, with no
+devsecops tool listed, is not checked: the ocs layout serves both registries.
 
 Each field arrives as the variable the workflows already read, masked:
 
@@ -149,9 +157,9 @@ value. `goproxy` is the one optional field: only Go builds use it. Other fields
 are ignored. A listed tool whose secret cannot be read stops the job: it is never
 skipped.
 
-`docker-build.yml` reads `cosign` only on a `release` build with `sign-image`,
-the only builds that sign. A branch build never needs a signing key in
-`devsecops/ci/dev`.
+`docker-build.yml` reads `cosign` only on a tag build with `sign-image` and
+`release`, the only builds that sign in openbao mode. There is no
+`devsecops/ci/dev/cosign`: the action refuses `cosign` on any other build.
 
 This map is the contract with csc-ocs-ansible: change both together. An
 operator writes each secret, never a pipeline, in one of two ways.
@@ -182,6 +190,112 @@ bao kv put -mount=devsecops ci/prod/cosign private_key=@cosign.key password=-
 `bao kv put` replaces the whole secret. To add one field to an existing secret,
 use `bao kv patch` with the same form.
 
+### The signing key (`cosign`)
+
+The Cosign key has a login role of its own. Each repository has three roles,
+and the caller names only the first:
+
+| Role | Logs in on | Reads |
+| --- | --- | --- |
+| `ci-<repo>` | every build that is not a tag | `devsecops/ci/dev/*` |
+| `ci-<repo>-release` | tag builds | `devsecops/ci/prod/*`, but not `devsecops/ci/prod/cosign` |
+| `ci-<repo>-sign` | tag builds, in a job of the catalog's `docker-build.yml` only | `devsecops/ci/prod/cosign`, nothing else |
+
+Why: every job of a tag build holds the release role, including the jobs that
+run `npm ci`, `tox` or a project's own build, and any step of such a job can
+request the job's OIDC token itself. While the release role could read the key,
+a malicious dependency in a tag build could log in with it and read the signing
+key, even in a job that never signs.
+
+So `docker-build.yml` reads the key:
+
+- alone. The read passes `tools: cosign` and nothing else, so the action logs
+  in as `<openbao-role>-sign`. The action refuses `cosign` together with
+  another tool or with `repo` names, and on a build that is not a tag.
+- in the step right before "Sign image (Cosign)", under the same gate
+  (`secrets-source: openbao`, `sign-image` and `release`), not with the other
+  reads at the start of the job. No step before the signature has the key in
+  its environment, and a build that fails a scan gate never reads it.
+- for the signing step only. The step right after it, "Clear the Cosign key
+  from the job environment", runs even when the signature failed
+  (`always()`), and sets `COSIGN_PRIVATE_KEY` and `COSIGN_PASSWORD` to empty
+  for the rest of the job. Only post steps follow it: those of the actions
+  the job used earlier (checkout, the registry logins, Buildx, the image
+  build).
+- from the devsecops layout only. In openbao mode, `sign-image` on a `release`
+  build needs `cosign` in `openbao-tools`, a tag build, and
+  `environment: prod`. Without any one of them, "Check secrets-source and
+  openbao-tools" stops the job before anything is built, not at the Cosign
+  read with the image already pushed. `ocs/ci/shared/COSIGN_*` is never read.
+
+`node-workflow.yml` forwards `sign-image`, `openbao-tools` and
+`docker-environment` (as `environment`) to `docker-build.yml`, and its
+`node-ci` job runs the same check first, before the Node build and the SBOM
+upload. Its image build is a job of `docker-build.yml`, which the `-sign` role
+is meant to accept; that rests on an assumption about nested calls, below.
+`python-ci.yml` signs nothing.
+
+What the platform repository's OpenBao configuration must hold (the catalog
+cannot check it):
+
+- The release roles' policy denies `devsecops/data/ci/prod/cosign`
+  explicitly.
+- A policy that reads `devsecops/data/ci/prod/cosign` and nothing else, held
+  by the `-sign` roles only.
+- Per repository, a JWT role `ci-<repo>-sign` with that policy only,
+  `bound_claims_type: glob`, and these `bound_claims`:
+  - `repository`: the repository, `<org>/<repo>`;
+  - `ref_type`: `tag`;
+  - `job_workflow_ref`:
+    `CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@*`.
+- The policy for `ocs/ci/shared`, held by the base `ci-<repo>` roles, denies
+  `ocs/data/ci/shared/COSIGN_PRIVATE_KEY` and
+  `ocs/data/ci/shared/COSIGN_PASSWORD`. Every branch and pull request build
+  holds that policy, so the ocs layout must never hand out the key.
+
+`job_workflow_ref` is the GitHub OIDC claim that names the reusable workflow
+that defines the job, at the ref of the `uses:` line that called it. So a
+`node-workflow.yml` or `python-ci.yml` job that runs `npm ci` or `tox` cannot
+get the `-sign` role, and a `docker-build.yml` job that a repository calls
+directly can. `@*` accepts any catalog ref, for two reasons:
+
+- pilot repositories call the catalog at a branch while it is tested;
+- through `node-workflow.yml`, the `uses:` line that calls `docker-build.yml`
+  is the catalog's own nested call, not the pilot's. It names
+  `@ci/openbao-secrets` on this branch and `@develop` after the merge (below).
+  So a pilot that calls a catalog release through `node-workflow.yml` still
+  presents `docker-build.yml@refs/heads/develop` (with the nested-call
+  assumption below).
+
+The binding is tightened to `@refs/tags/*` only once both hold: the pilots
+call a catalog release, **and** the catalog's nested calls to
+`docker-build.yml` name a release tag. Tightened on the first alone, signing
+through `node-workflow.yml` breaks: its login as `-sign` is refused.
+
+**Not verified yet: nested calls.** GitHub documents the claim for a job of
+one reusable workflow called by a repository. It does not say what the claim
+names when that workflow is itself called by another reusable workflow, as
+`node-workflow.yml` calls `docker-build.yml`. The design assumes it names the
+innermost workflow, the one that defines the job (`docker-build.yml`). Until a
+real tag build confirms it, treat signing through `node-workflow.yml` in
+openbao mode as untested:
+
+- Confirm it on the first tag build of a `node-workflow.yml` caller with
+  `sign-image`, `docker-release`, `cosign` in `openbao-tools` and
+  `docker-environment: prod`. In the nested `docker` job, the step "Read Cosign
+  secrets from OpenBao" logs `role <openbao-role>-sign` when the login
+  succeeds.
+- If that login is refused and the role exists, suspect the claim first: it
+  may name `node-workflow.yml`. The action's error points back here. Do not
+  widen the `-sign` binding to `node-workflow.yml`: its `node-ci` job runs
+  `npm ci`, the case the role exists to keep out. Until this is settled, a
+  repository that must sign in openbao mode calls `docker-build.yml` directly.
+
+What this does not cover: every step of the `docker-build.yml` `docker` job
+can still request the job's token and log in as `-sign`. Those steps run only
+actions the catalog pins, never a project's dependencies: the image's `RUN`
+steps run inside BuildKit, without the job's token.
+
 ### Test it from a pilot repository
 
 While the branch `ci/openbao-secrets` is under test, call the catalog at that
@@ -198,7 +312,7 @@ jobs:
     with:
       runs-on: containerized
       secrets-source: openbao
-      openbao-role: ci-ocs-operator-app
+      openbao-role: ci-<repo>   # the repository's base role name
       openbao-tools: nexus sonarqube dependency-track
     secrets: inherit
 ```
@@ -207,12 +321,18 @@ jobs:
    step logs, without values, which variables it exported per tool.
 2. A version tag exercises `ci-<repo>-release` and `devsecops/ci/prod/*`. Set
    the image build's environment to `prod` (`docker-environment: prod` here).
+   With `sign-image`, `docker-release` and `cosign` in `openbao-tools`, it also
+   exercises `ci-<repo>-sign` and `devsecops/ci/prod/cosign`, read in the step
+   right before the signature. Through `node-workflow.yml`, that run is also
+   the check of the [nested-call assumption](#the-signing-key-cosign).
 3. Expected failures, worth seeing once: a branch build with
    `docker-environment: prod` stops at the read; a tool whose secret does not
    exist stops the job naming its path; a secret without one of its required
    fields stops the job naming the path and the field; a misspelled tool in
    `openbao-tools`, or a misspelled `secrets-source`, stops the job at
-   "Check secrets-source and openbao-tools".
+   "Check secrets-source and openbao-tools", and so does `sign-image` on a
+   `docker-release` build without `cosign` in `openbao-tools`, or with
+   `docker-environment` other than `prod`.
 
 Before the branch is merged, every `@ci/openbao-secrets` ref inside the
 catalog goes back to `@develop`, and the pilots move to `@develop` with it.
@@ -228,8 +348,7 @@ and exports the names as masked environment variables (`shared` / `repo` names
 in the ocs layout, `tools` in the devsecops layout; one call takes one layout). A job of your own can use
 it directly for repository-specific secrets (`repo:` input). If OpenBao cannot be
 read, the job stops with a message that names OpenBao and lists what to check; the
-first thing to check is whether OpenBao is **sealed** (it is unsealed by hand
-after any restart).
+first thing to check is whether OpenBao is **sealed**.
 
 A job with `container:` is a sibling container on the node and is not on the
 OpenBao overlay: the reusable workflows add `options: --network ocs_openbao` in

@@ -67,7 +67,7 @@ on:
         type: string
         default: "https://openbao:8200"
       openbao-role:
-        description: "OpenBao JWT role of this repository, e.g. ci-ocs-operator-backend (secrets-source: openbao)"
+        description: "OpenBao JWT role of this repository, ci-<repo> (secrets-source: openbao)"
         required: false
         type: string
         default: ""
@@ -129,12 +129,13 @@ jobs:
               printf "::error::secrets-source must be 'github' (the default) or 'openbao', got '%s'.\n" "$(shown "$SECRETS_SOURCE")"
               exit 1 ;;
           esac
-          if [ "$SECRETS_SOURCE" != openbao ] || [ -z "$OPENBAO_TOOLS" ]; then
+          if [ "$SECRETS_SOURCE" != openbao ]; then
             echo "secrets-source: $SECRETS_SOURCE"
             exit 0
           fi
           # One line, one space between names: the only form the matchers see.
           # The letters are spelled out: in some locales a-z takes in capitals.
+          # An empty list passes both checks.
           case $OPENBAO_TOOLS in
             ' '* | *' ' | *'  '* | *[!abcdefghijklmnopqrstuvwxyz\ -]*)
               printf "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got '%s'). Known: %s.\n" "$(shown "$OPENBAO_TOOLS")" "$known"
@@ -146,7 +147,34 @@ jobs:
               *) printf "::error::Unknown tool '%s' in openbao-tools. Known: %s.\n" "$t" "$known"; exit 1 ;;
             esac
           done
-          echo "secrets-source: openbao, openbao-tools: $OPENBAO_TOOLS"
+          # Signing in openbao mode reads the key from the devsecops layout only,
+          # alone, with the <openbao-role>-sign role, right before the signing
+          # step: the ocs/ci/shared layout never serves it, the role is bound to
+          # tag builds, and the action refuses a tag build whose environment is
+          # not prod (a tag build reads prod values only). All three refused
+          # here, before anything is built, not at the signing step with the
+          # image already pushed: with nexus not in openbao-tools, the Cosign
+          # read is the first read that checks the environment. SIGN_IMAGE,
+          # RELEASE, REF_TYPE and ENVIRONMENT are set where an image is signed
+          # (docker-build.yml, and node-workflow.yml for its image build), unset
+          # elsewhere.
+          if [ "${SIGN_IMAGE:-false}" = true ] && [ "${RELEASE:-false}" = true ]; then
+            case " $OPENBAO_TOOLS " in
+              *" cosign "*) ;;
+              *)
+                printf "::error::sign-image on a release build in openbao mode needs cosign in openbao-tools (got '%s'). Signing in openbao mode reads the key with the <openbao-role>-sign role, from the devsecops layout only, right before the signing step; ocs/ci/shared does not serve it. Add cosign to openbao-tools.\n" "$OPENBAO_TOOLS"
+                exit 1 ;;
+            esac
+            if [ "${REF_TYPE:-}" != tag ]; then
+              printf "::error::sign-image on a release build in openbao mode signs tag builds only, and this is a '%s' build: the <openbao-role>-sign role that reads the key is bound to tag builds. Push a version tag, or turn off sign-image or release for this build.\n" "${REF_TYPE:-}"
+              exit 1
+            fi
+            if [ "${ENVIRONMENT:-}" != prod ]; then
+              printf "::error::sign-image on a release build in openbao mode needs the image build's environment to be prod (got '%s'): it signs tag builds only, a tag build reads prod values only, and the Cosign read, right before the signature, would refuse any other environment after the image is pushed. Set environment: prod (docker-environment: prod for node-workflow.yml).\n" "$(shown "${ENVIRONMENT:-}")"
+              exit 1
+            fi
+          fi
+          echo "secrets-source: openbao, openbao-tools: ${OPENBAO_TOOLS:-none}"
 
       # Exactly one of tools / shared is set: the devsecops layout when the
       # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
