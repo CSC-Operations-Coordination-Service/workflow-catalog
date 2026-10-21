@@ -32,11 +32,30 @@ check "a failed ocs read lists the ocs/ci paths it needed" "grep -q 'paths=\"\$p
 check "the action does not name scripts/ci-secrets as the devsecops writer" "! grep -q 'scripts/ci-secrets writes' '$ACT' && grep -q 'does not write this layout yet' '$ACT'"
 
 # --- the workflows
-# Lines reading a managed value that are NOT in the guarded form
+# Reads of a managed value that are NOT in the guarded form
 #   inputs.secrets-source == 'openbao' && env.X || (inputs.secrets-source != 'openbao' && secrets.X || '')
 # In openbao mode that form gives env.X or '', never secrets.X: a gap in OpenBao
 # stays a gap instead of being filled by a GitHub secret through secrets: inherit.
-unguarded() { grep -En "secrets\.($MANAGED)\b" "$1" | grep -vE "inputs\.secrets-source == 'openbao' && env\.([A-Z_]+) \|\| \(inputs\.secrets-source != 'openbao' && secrets\.\1 \|\| ''\)"; }
+# Every guarded form is cut out first, then any secrets.X left is a read outside
+# it, wherever it sits: a second ${{ }} on the same line, or an if: without
+# ${{ }}. Prints file:line:text of each line holding one (GNU sed and grep).
+GUARDED="inputs\.secrets-source == 'openbao' && env\.([A-Z_]+) \|\| \(inputs\.secrets-source != 'openbao' && secrets\.\1 \|\| ''\)"
+unguarded() { sed -E "s/$GUARDED//g" "$1" | grep -En "secrets\.($MANAGED)\b"; }
+# unguarded() on itself: one guarded read is clean; anything else next to it,
+# or a guarded form whose env.X and secrets.X differ, is reported.
+G="inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_HOST || '')"
+G_MIXED="inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PORT || '')"
+flags() { printf '%s\n' "$1" >"$tmp/unguarded.yml"; [ -n "$(unguarded "$tmp/unguarded.yml")" ]; }
+u_clean()    { ! flags "a: \${{ $G }} \${{ $G }}"; }
+u_after()    { flags "a: \${{ $G }}/\${{ secrets.NEXUS_PORT }}"; }
+u_inside()   { flags "a: \${{ $G || secrets.NEXUS_HOST }}"; }
+u_bare_if()  { flags "if: secrets.NEXUS_HOST != ''"; }
+u_mixed()    { flags "a: \${{ $G_MIXED }}"; }
+check "unguarded(): two guarded reads on one line are clean" u_clean
+check "unguarded(): flags an unguarded \${{ }} after a guarded one on the same line" u_after
+check "unguarded(): flags secrets.X inside the same \${{ }} as a guarded form" u_inside
+check "unguarded(): flags an if: without \${{ }}" u_bare_if
+check "unguarded(): flags a guarded form whose env.X and secrets.X differ" u_mixed
 # Step text as YAML sees it: run_of <workflow> <job> <step name>
 run_of() { python3 - "$1" "$2" "$3" <<'EOF'
 import sys, yaml
