@@ -28,7 +28,7 @@ placeholders while rendering those files into `$HOME`.
 
 | Secret | Used by | Description |
 | --- | --- | --- |
-| `NEXUS_HOST` | `nexus-context` (pip + twine), `npm-context` (npm) | Bare hostname — **no scheme, no port, no path**, e.g. `oep-sysma-mondb-02.ocs.local`. Also becomes the `machine` entry in the generated `~/.netrc`. |
+| `NEXUS_HOST` | `nexus-context` (pip + twine), `npm-context` (npm) | Bare hostname — **no scheme, no port, no path**, e.g. `nexus.example.internal`. Also becomes the `machine` entry in the generated `~/.netrc`. |
 | `NEXUS_PORT` | `nexus-context` (pip + twine), `npm-context` (npm) | Port only, e.g. `8081`. Leave unset for the scheme default (80/443) — the `:<port>` is then dropped from the URL. |
 
 ## Nexus — shared credentials
@@ -48,8 +48,8 @@ placeholders while rendering those files into `$HOME`.
 
 | Secret | Used by | Description |
 | --- | --- | --- |
-| `NEXUS_DOCKER_REGISTRY_DEV` | `docker-local` (develop) | Dev Docker registry `host:port` to push to, e.g. `127.0.0.1:8082`. No scheme, no image path. |
-| `NEXUS_DOCKER_REGISTRY_PROD` | `docker-registry` (release tags) | Prod Docker registry `host:port`, e.g. `127.0.0.1:8084`. |
+| `NEXUS_DOCKER_REGISTRY_DEV` | `docker-local` (develop) | Dev Docker registry `<host>:<port>` to push to, e.g. `nexus.example.internal:5000`. No scheme, no image path. |
+| `NEXUS_DOCKER_REGISTRY_PROD` | `docker-registry` (release tags) | Prod Docker registry `<host>:<port>`, e.g. `nexus.example.internal:5001`. |
 
 ## Nexus — package registries for image builds
 

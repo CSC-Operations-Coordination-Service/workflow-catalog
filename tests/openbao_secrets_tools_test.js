@@ -16,11 +16,11 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 // holds. Every value here is a dummy.
 const SECRETS = {
   'ci-x': {
-    'devsecops/data/ci/dev/nexus': { host: 'nexus.ocs.local', port: 8082, username: 'dev-artifact', password: 'dev-pw', docker_registry: 'registry-dev.ocs-registry.local', url: 'http://ignored' },
+    'devsecops/data/ci/dev/nexus': { host: 'nexus.example.internal', port: 5000, username: 'ci-user-dev', password: 'dev-pw', docker_registry: 'registry-dev.example.internal', url: 'http://ignored' },
     'ocs/data/ci/repo-x/EXTRA': { value: 'extra-value' },
   },
   'ci-x-release': {
-    'devsecops/data/ci/prod/nexus': { host: 'nexus.ocs.local', port: '8084', username: 'prod-artifact', password: 'prod-pw', docker_registry: 'registry.ocs-registry.local', goproxy: 'http://goproxy.ocs.local' },
+    'devsecops/data/ci/prod/nexus': { host: 'nexus.example.internal', port: '5001', username: 'ci-user-prod', password: 'prod-pw', docker_registry: 'registry.example.internal', goproxy: 'http://goproxy.example.internal' },
   },
   'ci-x-sign': {
     'devsecops/data/ci/prod/cosign': { private_key: '-----BEGIN KEY-----\nAAAA\nBBBB\n-----END KEY-----', password: 'cosign-pw' },
@@ -105,10 +105,10 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
 
   let o = await run({ OPENBAO_TOOLS: 'nexus' });
   check('branch build: no error', o.error === null);
-  check('branch build: logs in as the base role', o.logins.join() === 'ci-x' && o.exported.NEXUS_USERNAME === 'dev-artifact');
+  check('branch build: logs in as the base role', o.logins.join() === 'ci-x' && o.exported.NEXUS_USERNAME === 'ci-user-dev');
   check('branch build: reads devsecops/ci/dev/nexus', o.requests.includes('GET /v1/devsecops/data/ci/dev/nexus'));
-  check('branch build: exports the mapped names, port as a string', o.exported.NEXUS_HOST === 'nexus.ocs.local' && o.exported.NEXUS_PORT === '8082' && o.exported.NEXUS_PASSWORD === 'dev-pw');
-  check('branch build: docker_registry -> NEXUS_DOCKER_REGISTRY_DEV only', o.exported.NEXUS_DOCKER_REGISTRY_DEV === 'registry-dev.ocs-registry.local' && !('NEXUS_DOCKER_REGISTRY_PROD' in o.exported));
+  check('branch build: exports the mapped names, port as a string', o.exported.NEXUS_HOST === 'nexus.example.internal' && o.exported.NEXUS_PORT === '5000' && o.exported.NEXUS_PASSWORD === 'dev-pw');
+  check('branch build: docker_registry -> NEXUS_DOCKER_REGISTRY_DEV only', o.exported.NEXUS_DOCKER_REGISTRY_DEV === 'registry-dev.example.internal' && !('NEXUS_DOCKER_REGISTRY_PROD' in o.exported));
   check('an unmapped field (url) is not exported', !Object.values(o.exported).includes('http://ignored'));
   check('goproxy is optional: absent from the secret, no error and not exported', o.error === null && !('GOPROXY' in o.exported));
   check('every exported value is masked', allMasked(o));
@@ -116,9 +116,9 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
 
   o = await run({ OPENBAO_TOOLS: 'nexus', REF_TYPE: 'tag', REF_NAME: 'v1.2.3', OPENBAO_ENVIRONMENT: 'prod' });
   check('tag build: no error', o.error === null);
-  check('tag build: logs in as <role>-release and reads prod', o.logins.join() === 'ci-x-release' && o.exported.NEXUS_USERNAME === 'prod-artifact' && o.requests.includes('GET /v1/devsecops/data/ci/prod/nexus'));
-  check('tag build: docker_registry -> NEXUS_DOCKER_REGISTRY_PROD only', o.exported.NEXUS_DOCKER_REGISTRY_PROD === 'registry.ocs-registry.local' && !('NEXUS_DOCKER_REGISTRY_DEV' in o.exported));
-  check('goproxy, when stored, is exported as GOPROXY', o.exported.GOPROXY === 'http://goproxy.ocs.local');
+  check('tag build: logs in as <role>-release and reads prod', o.logins.join() === 'ci-x-release' && o.exported.NEXUS_USERNAME === 'ci-user-prod' && o.requests.includes('GET /v1/devsecops/data/ci/prod/nexus'));
+  check('tag build: docker_registry -> NEXUS_DOCKER_REGISTRY_PROD only', o.exported.NEXUS_DOCKER_REGISTRY_PROD === 'registry.example.internal' && !('NEXUS_DOCKER_REGISTRY_DEV' in o.exported));
+  check('goproxy, when stored, is exported as GOPROXY', o.exported.GOPROXY === 'http://goproxy.example.internal');
 
   o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_ENVIRONMENT: 'prod' });
   check('branch build asking for prod stops, before any request', /tag builds only/.test(o.error || '') && o.requests.length === 0);

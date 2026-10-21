@@ -1,9 +1,9 @@
 # Secrets from OpenBao (private repositories)
 
-Organization secrets cannot be used by private repositories on our plan. For
-those, the catalog workflows can read the same values from OpenBao instead, with
-the job's own GitHub OIDC token: no vault token and no other secret is stored in
-the repository.
+For private repositories that cannot use organization secrets, the catalog
+workflows can read the same values from OpenBao instead, with the job's own
+GitHub OIDC token: no vault token and no other secret is stored in the
+repository.
 
 Applies to `node-workflow.yml`, `docker-build.yml` and `python-ci.yml`. Default
 behaviour is unchanged: without the inputs below every value still comes from
@@ -29,7 +29,7 @@ URL.
 | Input | Default | Purpose |
 | --- | --- | --- |
 | `secrets-source` | `github` | `openbao` reads the values from OpenBao. Any other value (`open-bao`, `OpenBao`, empty) stops the job at the step "Check secrets-source and openbao-tools", before any read |
-| `openbao-url` | `https://openbao:8200` | Reachable from the runner pool only (overlay `ocs_openbao`) |
+| `openbao-url` | `https://openbao:8200` | Reachable from the runner pool only (overlay `ocs_openbao`). `https://` only: any other scheme stops the job before the login, which would send the job's token in clear |
 | `openbao-role` | — | The repository's JWT role, `ci-<repo>` (the base name: in the devsecops layout the action adds `-release` or `-sign` itself) |
 | `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), separated by single spaces on one line (`nexus sonarqube`). An unknown name, a comma, a tab or a newline stops the job at the step "Check secrets-source and openbao-tools". Empty: every value from `ocs/ci/shared`, as before. With `sign-image` on a `release` build, `cosign` is required, and so are a tag build and `environment: prod` ([the signing key](#the-signing-key-cosign)) |
 | `runs-on` | `self-hosted` | Use `containerized` (a single label; the input is a string, not a list) |
@@ -74,11 +74,11 @@ kv-v2 mount `ocs`, one secret per name, the value in the key `value`:
 | `ocs/ci/shared/<NAME>` (`NEXUS_HOST`, `NEXUS_PASSWORD`, `DOCKERHUB_TOKEN`, ...) | every CI role |
 | `ocs/ci/<repository>/<NAME>` | that repository's role only |
 
-An operator writes them, never a pipeline: `ocs/ci/shared/<NAME>` with
-csc-ocs-ansible's `scripts/ci-secrets/ci_secrets.py` (its default layout) or by
-hand, `ocs/ci/<repository>/<NAME>` by hand only. By hand, the value goes in
-from stdin: `bao kv put ocs/ci/shared/NEXUS_PASSWORD value=-`. Roles and
-policies are in csc-ocs-ansible (`stacks/platform/openbao/openbao-config.yml`).
+An operator writes them, never a pipeline: `ocs/ci/shared/<NAME>` with the
+platform repository's CI-secrets tool (its default layout) or by hand,
+`ocs/ci/<repository>/<NAME>` by hand only. By hand, the value goes in from
+stdin: `bao kv put ocs/ci/shared/NEXUS_PASSWORD value=-`. Roles and policies
+are in the platform repository's OpenBao configuration.
 
 The names each workflow reads from `ocs/ci/shared`, for a tool not listed in
 `openbao-tools`. Every name read must exist: one missing path stops the read.
@@ -96,16 +96,11 @@ without its value.
 | `docker-build.yml` | `sign-image` on a `release` build | none: the signing key comes from the devsecops layout only, with `cosign` in `openbao-tools` ([the signing key](#the-signing-key-cosign)) |
 | `python-ci.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `SONAR_TOKEN`, `SONAR_HOST_URL` |
 
-`python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`. csc-ocs-ansible's
-`scripts/ci-secrets/ci_secrets.py` stores it: its default layout, component
-`static`, from the credentials-file key `SONAR_HOST_URL` (it removes a trailing
-`/`, which `python-ci.yml` refuses). Run it with `--dry-run` first: it reads
-OpenBao, says what it would store, and writes nothing.
-
-```bash
-python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --only static --dry-run
-python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --only static
-```
+`python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`. The platform
+repository's CI-secrets tool stores it, in its default layout (it removes a
+trailing `/`, which `python-ci.yml` refuses). Run it as a dry run first: it
+reads OpenBao, says what it would store, and writes nothing. Its own
+documentation, in the platform repository, says how.
 
 While `ocs/ci/shared/SONAR_HOST_URL` is not stored, the `sonarqube` job of a
 `python-ci.yml` caller in openbao mode stops at its OpenBao read, unless the
@@ -161,21 +156,15 @@ skipped.
 `release`, the only builds that sign in openbao mode. There is no
 `devsecops/ci/dev/cosign`: the action refuses `cosign` on any other build.
 
-This map is the contract with csc-ocs-ansible: change both together. An
-operator writes each secret, never a pipeline, in one of two ways.
+This map is the contract with the platform repository's CI-secrets tool:
+change both together. An operator writes each secret, never a pipeline, in one
+of two ways.
 
-With csc-ocs-ansible's `scripts/ci-secrets/ci_secrets.py --layout devsecops`. It
-reads the values from a credentials file (chmod 600, outside any repository),
-can mint the SonarQube token and the Dependency-Track key, and keeps a field
-already stored unless told to rotate it. Its components have the tool names
-above, so `--only` takes them. Run it with `--dry-run` first: it reads OpenBao,
-says what it would store or mint, and writes and mints nothing. Its
-`scripts/ci-secrets/README.md` gives the credentials-file key of each field.
-
-```bash
-python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --layout devsecops --dry-run
-python3 scripts/ci-secrets/ci_secrets.py --env <credentials file> --layout devsecops --only nexus,sonarqube
-```
+With the platform repository's CI-secrets tool, in its devsecops layout. Its
+components have the tool names above. Run it as a dry run first: it reads
+OpenBao, says what it would store, and writes nothing. Its own documentation,
+in the platform repository, gives the commands and where each field comes
+from.
 
 Or by hand, with `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
 A secret value goes in from stdin (`field=-`, typed or piped, one per command)
@@ -263,14 +252,19 @@ directly can. `@*` accepts any catalog ref, for two reasons:
 - through `node-workflow.yml`, the `uses:` line that calls `docker-build.yml`
   is the catalog's own nested call, not the pilot's. It names
   `@ci/openbao-secrets` on this branch and `@develop` after the merge (below).
-  So a pilot that calls a catalog release through `node-workflow.yml` still
-  presents `docker-build.yml@refs/heads/develop` (with the nested-call
-  assumption below).
+  A release made as [releasing.md](releasing.md) says pins it to the release
+  tag, so a pilot that calls such a release through `node-workflow.yml`
+  presents `docker-build.yml@refs/tags/<tag>` (with the nested-call assumption
+  below).
 
-The binding is tightened to `@refs/tags/*` only once both hold: the pilots
-call a catalog release, **and** the catalog's nested calls to
-`docker-build.yml` name a release tag. Tightened on the first alone, signing
-through `node-workflow.yml` breaks: its login as `-sign` is refused.
+The binding is tightened to `@refs/tags/*` once both hold: the pilots call a
+catalog release, **and** the catalog's nested calls to `docker-build.yml` name
+a release tag. Tag `1.0.0` has no openbao mode at all, so signing in openbao
+mode needs a release after `1.0.0`, and every such release made with
+`scripts/pin-catalog-refs.sh` meets the second condition. What is left is the
+first: every pilot that signs in openbao mode calls such a release, not a
+branch. Tightened before that, the login as `-sign` of a pilot still on a
+branch is refused.
 
 **Not verified yet: nested calls.** GitHub documents the claim for a job of
 one reusable workflow called by a repository. It does not say what the claim
@@ -335,7 +329,8 @@ jobs:
    `docker-environment` other than `prod`.
 
 Before the branch is merged, every `@ci/openbao-secrets` ref inside the
-catalog goes back to `@develop`, and the pilots move to `@develop` with it.
+catalog goes back to `@develop` (`scripts/pin-catalog-refs.sh develop`, see
+[releasing.md](releasing.md)), and the pilots move to `@develop` with it.
 
 The action's devsecops read can be tested locally against a mock OpenBao:
 `bash tests/openbao_secrets_tools_test.sh` (node, openssl and PyYAML; no

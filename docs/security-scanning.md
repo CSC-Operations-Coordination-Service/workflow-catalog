@@ -245,8 +245,7 @@ Enable it on any image build by passing `lint-image: true` to
 **built image's layers** against the CIS Docker Benchmark and best practices:
 runs as root, setuid/setgid binaries, credentials/secrets baked into a layer,
 uncleared package caches, `sudo`, use of `ADD` over `COPY`, and more. It pulls
-the image by digest through the runner's docker socket, reusing the Nexus login
-(no extra secret).
+the image by digest, reusing the Nexus login of the push (no extra secret).
 
 | Input | Default | Purpose |
 | --- | --- | --- |

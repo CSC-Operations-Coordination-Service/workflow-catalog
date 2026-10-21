@@ -122,14 +122,13 @@ on:
         description: >
           Network of the docker-container builder (buildkitd), which is the one
           that pushes. `auto` (default): `host` when the registry resolved for
-          `environment` is a `*.ocs-registry.local` name, otherwise Docker's
-          default bridge. `host` / `bridge` force one or the other. The
-          ocs-registry.local names resolve only through the runner node's
-          /etc/hosts, to 127.0.0.1, where the routing mesh hands port 80 to
-          Traefik. A builder on the default bridge sees neither that file nor
-          the runner's overlay aliases, and its 127.0.0.1 is itself, so its push
-          fails with "no such host". On the host network it shares the node's
-          /etc/hosts and loopback. See docs/docker-build-network.md.
+          `environment` is one of the internal registry names, otherwise
+          Docker's default bridge. `host` / `bridge` force one or the other.
+          The internal registry names resolve only through the runner node's
+          /etc/hosts, to the node's own loopback. A builder on the default
+          bridge sees neither that file nor the node's loopback, so its push
+          fails with "no such host". On the host network it shares both. See
+          docs/docker-build-network.md.
         required: false
         type: string
         default: "auto"
@@ -457,12 +456,15 @@ jobs:
       - name: Resolve Nexus registry for context
         # Pick the dev or prod Docker registry based on the `environment` input,
         # then normalise and validate it. A registry secret carrying a scheme
-        # ("https://host:8082"), a trailing slash, or stray whitespace produces a
-        # tag like "https://host:8082/app:develop", which buildx rejects with a
+        # ("https://host:5000"), a trailing slash, or stray whitespace produces a
+        # tag like "https://host:5000/app:develop", which buildx rejects with a
         # bare "invalid reference format". GitHub masks the value, so the log
         # shows only "***/app:develop" and the cause is invisible. Normalise the
         # usual copy-paste damage and fail here, naming the offending secret,
         # instead of several steps later on an unreadable error.
+        # GitHub masks the secret as stored, not the normalised value (when the
+        # two differ) nor its host alone, and later steps print both (the
+        # BuildKit config, the image list). Both are masked before export.
         env:
           RAW_DEV: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_DEV || (inputs.secrets-source != 'openbao' && secrets.NEXUS_DOCKER_REGISTRY_DEV || '') }}
           RAW_PROD: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_PROD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_DOCKER_REGISTRY_PROD || '') }}
@@ -479,7 +481,7 @@ jobs:
           fi
 
           if [ -z "$raw" ]; then
-            echo "::error::$name is empty or unset. Set it to a bare host:port — no scheme, no path — e.g. nexus.example.local:8082"
+            echo "::error::$name is empty or unset. Set it to a bare host:port — no scheme, no path — e.g. nexus.example.internal:5000"
             exit 1
           fi
 
@@ -505,6 +507,11 @@ jobs:
           fi
           echo "registry resolved from $name (${#reg} characters)"
 
+          echo "::add-mask::$reg"
+          host=${reg%%:*}
+          if [ -n "$host" ] && [ "$host" != "$reg" ]; then
+            echo "::add-mask::$host"
+          fi
           echo "NEXUS_DOCKER_REGISTRY=$reg" >> "$GITHUB_ENV"
 
       - name: Compose BuildKit registry config
@@ -532,7 +539,7 @@ jobs:
           # Which network the builder container joins (see the builder-network
           # input). Decided from the resolved registry, not by the caller,
           # because the registry value comes from OpenBao or the secrets: a
-          # caller moved onto the ocs-registry.local names needs no change.
+          # caller moved onto the internal registry names needs no change.
           reg_host="${NEXUS_DOCKER_REGISTRY%%:*}"
           case "$BUILDER_NETWORK" in
             auto)
@@ -547,7 +554,7 @@ jobs:
               exit 1 ;;
           esac
           if [ "$net" = host ]; then
-            echo "BuildKit builder joins the runner node's host network (builder-network: $BUILDER_NETWORK, registry host $reg_host): it resolves the registry through the node's /etc/hosts and pushes through its 127.0.0.1"
+            echo "BuildKit builder joins the runner node's host network (builder-network: $BUILDER_NETWORK, registry host $reg_host): the registry name resolves only through the node's /etc/hosts"
           fi
 
           # An explicit host:port wins; otherwise pair the given connector port
@@ -618,10 +625,10 @@ jobs:
             if [ -n "$IMAGE" ]; then
               echo "image=$IMAGE"
             fi
-            # buildkitd then shares the node's network namespace, and so do its
-            # RUN steps (the builder image has no CNI): a build can reach what
-            # the node reaches. The job already has the node's docker socket,
-            # so this grants nothing it did not have.
+            # The internal registry names resolve only through the node's
+            # /etc/hosts (see builder-network). What the host network means for
+            # the build's RUN steps, and why the runners accept it: the
+            # platform repository's runner documentation.
             if [ "$net" = host ]; then
               echo "network=host"
             fi
@@ -718,16 +725,25 @@ jobs:
         # lowercases on its own, so the push works either way, but Cosign and
         # the scanners take this list verbatim and reject a mixed-case owner
         # (e.g. ghcr.io/CSC-Operations-Coordination-Service/...).
+        # Every value through the environment, never ${{ }} in the script: an
+        # image name or a secret pasted into the script would be run as code.
+        # NEXUS_DOCKER_REGISTRY is already in the job environment.
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          PUSH_TO_GHCR: ${{ inputs.push-to-ghcr }}
+          PUSH_TO_DOCKERHUB: ${{ inputs.push-to-dockerhub }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          DOCKERHUB_USER: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || (inputs.secrets-source != 'openbao' && secrets.DOCKERHUB_USERNAME || '') }}
         run: |
           {
             echo "list<<EOF"
             {
-              echo "${{ env.NEXUS_DOCKER_REGISTRY }}/${{ inputs.image-name }}"
-              if [ "${{ inputs.push-to-ghcr }}" = "true" ]; then
-                echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
+              echo "$NEXUS_DOCKER_REGISTRY/$IMAGE_NAME"
+              if [ "$PUSH_TO_GHCR" = "true" ]; then
+                echo "ghcr.io/$REPOSITORY_OWNER/$IMAGE_NAME"
               fi
-              if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
-                echo "${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || (inputs.secrets-source != 'openbao' && secrets.DOCKERHUB_USERNAME || '') }}/${{ inputs.image-name }}"
+              if [ "$PUSH_TO_DOCKERHUB" = "true" ]; then
+                echo "$DOCKERHUB_USER/$IMAGE_NAME"
               fi
             } | tr '[:upper:]' '[:lower:]'
             echo "EOF"
@@ -966,8 +982,8 @@ jobs:
       # Docker Benchmark and best practices (non-root, no setuid/setgid, no
       # secrets/credentials baked into layers, cleared package caches, ...).
       # Complements Checkov (Dockerfile source) and Grype (CVEs) by inspecting
-      # the actual image layers. Runs natively on the runner and pulls by digest
-      # through the docker socket, reusing the Nexus login above. Language-agnostic.
+      # the actual image layers. Runs natively on the runner and pulls by digest,
+      # reusing the Nexus login above. Language-agnostic.
       # -----------------------------------------------------------------------
       - name: Lint image hardening (Dockle)
         id: lint
@@ -1000,35 +1016,19 @@ jobs:
       # Needs the COSIGN_PRIVATE_KEY / COSIGN_PASSWORD secrets, or in openbao
       # mode cosign in openbao-tools. Language-agnostic.
       # -----------------------------------------------------------------------
-      # In openbao mode the key is read here, immediately before its only
-      # consumer, and not with the other reads at the start of the job: no
-      # step before the signature (the build, Syft, Grype, Dockle and their
-      # third-party actions) ever has it in its environment, and a build that
-      # fails a gate never reads it. It is read alone (tools: cosign), so the
-      # action logs in as <openbao-role>-sign, a role that reads the key and
-      # nothing else. Why a role of its own: an audit found that
-      # <openbao-role>-release, held by every job of a tag build, could read
-      # the key, and any step of a job that runs npm ci, tox or a project's
-      # build can request the job's OIDC token itself; a malicious dependency
-      # could log in as -release and read the key in a job that never signs.
-      # The platform repository's OpenBao configuration now denies the key to
-      # -release and binds -sign to the repository, to ref_type tag and to the
-      # jobs of this workflow (claim job_workflow_ref). When node-workflow.yml
-      # calls this workflow, the binding holds only if the claim names the
-      # workflow that defines the job (this one), not the outer one. That is
-      # an assumption, not verified yet: GitHub documents the claim for one
-      # level of reusable workflow only. Confirm it on the first tag build that
-      # signs through node-workflow.yml (docs/openbao-secrets.md). If the claim
-      # names node-workflow.yml instead, the -sign login is refused there, and
-      # such callers cannot sign in openbao mode until that is settled. The
-      # other steps of this job could still request the token
-      # themselves, but they run only actions the catalog pins, never a
-      # project's dependencies (the image's RUN steps run inside BuildKit,
-      # without the job's token). No ocs/ci/shared fallback: every build's role reads that
-      # layout, so it must never serve the key; "Check secrets-source and
-      # openbao-tools" refuses to sign without cosign in openbao-tools.
-      # Gated exactly like "Sign image (Cosign)": a build that does not sign
-      # never reads the key (and the action refuses cosign on a non-tag build).
+      # In openbao mode the key is read here, right before its only consumer,
+      # not with the reads at the start of the job: no step before the
+      # signature (the build, Syft, Grype, Dockle) has it in its environment,
+      # and a build that fails a gate never reads it. Its gate is the signing
+      # step's. Read alone (tools: cosign), so the action logs in as
+      # <openbao-role>-sign, which reads the key and nothing else: every job of
+      # a tag build holds <openbao-role>-release, and a dependency run by
+      # npm ci, tox or a project's build can request the job's OIDC token
+      # itself. The platform repository's OpenBao configuration binds -sign to
+      # the repository, to tag builds and to this workflow's jobs (claim
+      # job_workflow_ref); through node-workflow.yml that binding rests on an
+      # assumption not verified yet (docs/openbao-secrets.md). No ocs/ci/shared
+      # fallback: every build's role reads that layout.
       - name: Read Cosign secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets

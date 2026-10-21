@@ -49,7 +49,7 @@ runs:
 
         # Reachability preflight. Dependency-Track is typically an internal
         # server, and the log masks its URL as ***, so a bare `curl: (7) Failed
-        # to connect to *** port 5055` gives nothing to act on — and the two
+        # to connect to *** port <port>` gives nothing to act on — and the two
         # causes need opposite fixes. Probe the unauthenticated /api/version
         # first and report which one it is. curl's own stderr is kept: it
         # distinguishes "Could not resolve host" (exit 6) from "Could not connect

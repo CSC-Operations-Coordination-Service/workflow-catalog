@@ -104,7 +104,7 @@ Dependency-Track project automatically — no manual pre-registration.
 - **Upload from the host, not from a job container.** Dependency-Track is an
   internal server; a job container has its own resolver and no route to a port
   published on the runner host, so the upload dies as
-  `curl: (7) Failed to connect to *** port 5055 after 1 ms` — connect refused in
+  `curl: (7) Failed to connect to *** port <port> after 1 ms` — connect refused in
   ~0 ms, i.e. nothing left the runner. Generate the SBOM wherever the build tools
   live, publish it as an artifact, and upload it from a job with no `container:`
   (`publish` in [sbom.yml](../.github/workflows/sbom.yml), `sbom-publish` in

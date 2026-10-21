@@ -112,7 +112,7 @@ jobs:
   # Dependency-Track is an internal service, and a job container sits on the
   # docker bridge with its own resolver and no route to a host-published port —
   # from there the upload dies as
-  #   curl: (7) Failed to connect to *** port 5055 after 1 ms
+  #   curl: (7) Failed to connect to *** port <port> after 1 ms
   # (connect refused, ~0 ms, so nothing left the runner). The sibling image-SBOM
   # upload in docker-build.yml already reaches the same server from a
   # non-container job, and the SonarQube jobs in python-ci.yml only reach their

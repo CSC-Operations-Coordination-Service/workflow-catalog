@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Runs the "Compose BuildKit registry config" step of docker-build.yml with sample
 # inputs and asserts on the driver-opts it hands to setup-buildx-action: the
-# builder joins the node's network (network=host) when the push target is a
-# *.ocs-registry.local name, and only then, unless builder-network forces it.
-# Why: those names resolve only through the node's /etc/hosts (to 127.0.0.1, the
-# routing mesh, Traefik). The docker-container builder is a sibling container on
-# the daemon's default bridge: it sees neither that file nor the runner's overlay
-# aliases, and 127.0.0.1 there is its own loopback, so the push dies with
-# "lookup dev.ocs-registry.local ... no such host".
+# builder joins the node's network (network=host) when the push target is one of
+# the internal registry names the step matches, and only then, unless
+# builder-network forces it. The samples below use those names because the step's
+# case pattern must match them.
+# Why: those names resolve only through the node's /etc/hosts. The
+# docker-container builder is a sibling container on the daemon's default bridge:
+# it does not see that file, so the push dies with "lookup <registry name> ...
+# no such host" (docs/docker-build-network.md).
 # Needs python3 with PyYAML (the step is read from the workflow, not copied).
 # Run from anywhere: bash tests/docker_build_builder_network_test.sh
 set -uo pipefail
@@ -46,16 +47,16 @@ check "  ...and the step says why" "grep -q 'host network' '$WORK/log'"
 run_step prod.ocs-registry.local auto
 check "auto + prod.ocs-registry.local: builder on the host network" "[ $RC -eq 0 ] && grep -qx 'network=host' '$WORK/opts'"
 
-run_step nexus.example.local:8082 auto
+run_step nexus.example.internal:5000 auto
 check "auto + any other registry: default bridge (no network opt)" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
 
-run_step 127.0.0.1:8084 auto
-check "auto + 127.0.0.1:8084: default bridge (unchanged behaviour)" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
+run_step 127.0.0.1:5001 auto
+check "auto + a loopback registry (127.0.0.1:5001): default bridge (unchanged behaviour)" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
 
 run_step evilocs-registry.local auto
 check "auto + a look-alike host (no dot before ocs-registry.local): default bridge" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
 
-run_step nexus.example.local:8082 host
+run_step nexus.example.internal:5000 host
 check "builder-network host forces it for any registry" "[ $RC -eq 0 ] && grep -qx 'network=host' '$WORK/opts'"
 
 run_step dev.ocs-registry.local bridge
@@ -72,5 +73,5 @@ check "with a proxy: host network AND the name in BuildKit's no_proxy" \
 check "builder-network input exists, default auto" "grep -A14 '^      builder-network:' '$DOCKER' | grep -q 'default: \"auto\"'"
 check "the step reads it from inputs.builder-network" \
   "grep -q 'BUILDER_NETWORK: \${{ inputs.builder-network }}' '$DOCKER'"
-check "docs page explains the builder network" "grep -q 'builder-network' '$ROOT/docs/docker-build-network.md' && grep -q 'ocs-registry.local' '$ROOT/docs/docker-build-network.md'"
+check "docs page explains the builder network" "grep -q 'builder-network' '$ROOT/docs/docker-build-network.md' && grep -q 'internal registry names' '$ROOT/docs/docker-build-network.md'"
 exit $fail

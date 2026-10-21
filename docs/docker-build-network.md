@@ -10,7 +10,7 @@ times out" are both true at the same time.
 | 1 | Pull the image the builder itself runs on (`moby/buildkit:buildx-stable-1`) | the runner's **docker daemon** | `buildkit-image` input (or the daemon's own `registry-mirrors` / proxy in `/etc/docker/daemon.json`) |
 | 2 | Resolve `# syntax=` and `FROM` images | **BuildKit**, inside its container | `registry-mirror-port` / `registry-mirror` input, or the `BUILDKIT_HTTP_PROXY` repo variable |
 | 3 | Fetch packages inside a `RUN` step (`pip install`, `npm ci`, …) | the **build container**, per RUN step | `mount-pip-index` / `mount-npm-registry` inputs — plus a Dockerfile that consumes the secret |
-| 4 | Push the built image to Nexus | **BuildKit** | `insecure-registry` input (plain-HTTP connector), plus `no_proxy` — handled automatically; for the `*.ocs-registry.local` names, the builder's network too (`builder-network`, automatic) |
+| 4 | Push the built image to Nexus | **BuildKit** | `insecure-registry` input (plain-HTTP connector), plus `no_proxy` — handled automatically; for the internal registry names, the builder's network too (`builder-network`, automatic) |
 
 Hop 3 is the one that surprises people, because it fails *after* a green hop 2.
 BuildKit resolves `FROM` with its own egress — the mirror, or the proxy in its
@@ -31,36 +31,32 @@ resolve to loopback (an overlay alias, for instance), those tools otherwise fail
 `Get "https://<registry>/v2/": ... connection refused`. With `insecure-registry: false`
 the three values are `false`, the tools' default.
 
-### Hop 4 through the `ocs-registry.local` names: `builder-network`
+### Hop 4 through the internal registry names: `builder-network`
 
-`dev.ocs-registry.local` and `prod.ocs-registry.local` resolve only through the
-runner node's `/etc/hosts`, to `127.0.0.1`, where the swarm routing mesh hands
-port 80 to Traefik and Traefik routes by `Host` to the Nexus connector. The push
-is made by **BuildKit**, not by the daemon, and setup-buildx-action runs BuildKit
-in a `docker-container` builder: a sibling container on the daemon's default
-bridge. It sees neither the node's `/etc/hosts` nor the overlay aliases the runner
-container resolves the names through, and `127.0.0.1` there is the builder itself.
-The push then fails with
-`dial tcp: lookup dev.ocs-registry.local on <dns>:53: no such host`.
+The internal registry names resolve only through the runner node's
+`/etc/hosts`, to the node's own loopback. The push is made by **BuildKit**, not
+by the daemon, and setup-buildx-action runs BuildKit in a `docker-container`
+builder: a sibling container on the daemon's default bridge. It does not see
+the node's `/etc/hosts`, and its loopback is the builder itself. The push then
+fails with `dial tcp: lookup <registry name> on <dns>:53: no such host`.
 
 `builder-network: auto` (the default) gives the builder `network=host` whenever
-the resolved registry host is a `*.ocs-registry.local` name, so it shares the
-node's `/etc/hosts` and loopback; any other registry keeps the default bridge.
+the resolved registry host is one of the internal registry names (the step
+matches them by their suffix), so it shares the node's `/etc/hosts` and
+loopback; any other registry keeps the default bridge.
 `host` / `bridge` force one or the other. The `buildkitd.toml` entry
-`[registry."dev.ocs-registry.local"] http = true` (from `insecure-registry`) is
-unchanged: the name has no port. Checked 2026-10-20 on a docker:28-dind swarm
-node with Traefik v3.7.13 and Nexus 3.77.0, from a container holding the node's
-docker socket on the Traefik overlay (buildx v0.29.1): the default builder fails
-with the error above, `network=host` pushes.
+`[registry."<registry name>"] http = true` (from `insecure-registry`) is
+unchanged: the name has no port. On the default bridge the push fails with the
+error above; with `network=host` it goes through.
 
-On the host network buildkitd's `RUN` steps share the node's network namespace
-too (the builder image has no CNI). The job already holds the node's docker
-socket, so that grants nothing new. Note that buildx does **not** copy the
-`proxies` of the runner's `~/.docker/config.json` into the builder container
-(same check: its environment held no proxy variable); the builder's proxy is only
-what this workflow passes as `env.*` driver-opts, whose `no_proxy` already names
-the registry. The read-back steps below run in the runner container instead, so
-there the runner's own `NO_PROXY` must cover the names.
+What the host network means for the build's `RUN` steps, and why the runners
+accept it, is in the platform repository's runner documentation.
+
+buildx does **not** copy the `proxies` of the runner's `~/.docker/config.json`
+into the builder container: the builder's proxy is only what this workflow
+passes as `env.*` driver-opts, whose `no_proxy` already names the registry. The
+read-back steps below run in the job's own environment instead, so there the
+runner's own `NO_PROXY` must cover the names.
 
 Hop 1 happens **before** hops 2 and 3 are even possible: the `buildkitd.toml`
 mirror config and the proxy `driver-opts` are handed to a BuildKit that does not
@@ -77,7 +73,7 @@ exist until its image has been pulled. So neither of them can help hop 1.
 | `npm ci` fails `401 Unauthorized` against the Nexus registry | 3 | The repo needs authentication and `NEXUS_USERNAME`/`NEXUS_PASSWORD` were not both set, so the `_auth` line was omitted. The step logs `(anonymous — …)` when that happens |
 | Push fails with `http: server gave HTTP response to HTTPS client`, or an https probe of the connector returns TLS `packet length too long` | 4 | `insecure-registry: true` |
 | Push succeeds, then **Sign image (Cosign)** fails reaching the same registry over https | 4 | Same `insecure-registry: true` — it is forwarded to Cosign as `--allow-insecure-registry`, applied only to references on that host so GHCR and Docker Hub keep TLS |
-| Push fails with `lookup dev.ocs-registry.local ... no such host` (or `prod.`) | 4 | The builder is on the default bridge: leave `builder-network` at `auto` (or set `host`). `bridge` reproduces the failure |
+| Push fails with `lookup <internal registry name> ... no such host` | 4 | The builder is on the default bridge: leave `builder-network` at `auto` (or set `host`). `bridge` reproduces the failure |
 | Push is sent to an internet-facing proxy and fails | 4 | Already handled: the registry and mirror are added to BuildKit's `no_proxy` (host **and** host:port, since a ported `no_proxy` entry only matches that port) |
 
 ## Notes on the Nexus side

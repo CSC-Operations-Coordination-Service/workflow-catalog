@@ -28,7 +28,7 @@ inputs:
   nexus-host:
     description: >
       Nexus hostname, no scheme and no port — pass the NEXUS_HOST secret.
-      Example: oep-sysma-mondb-02.ocs.local
+      Example: nexus.example.internal
     required: true
   nexus-port:
     description: >
