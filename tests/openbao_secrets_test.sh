@@ -8,6 +8,7 @@ NODE="$ROOT/.github/workflows/node-workflow.yml"
 DOCKER="$ROOT/.github/workflows/docker-build.yml"
 PY="$ROOT/.github/workflows/python-ci.yml"
 fail=0
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 check() { if eval "$2"; then echo "ok   - $1"; else echo "FAIL - $1"; fail=1; fi; }
 MANAGED='NEXUS_HOST|NEXUS_PORT|NEXUS_USERNAME|NEXUS_PASSWORD|NEXUS_DOCKER_REGISTRY_DEV|NEXUS_DOCKER_REGISTRY_PROD|DEPENDENCYTRACK_URL|DEPENDENCYTRACK_API_KEY|DOCKERHUB_USERNAME|DOCKERHUB_TOKEN|COSIGN_PRIVATE_KEY|COSIGN_PASSWORD|SONAR_TOKEN|SONAR_HOST_URL'
 
@@ -62,30 +63,50 @@ done
 # The guarded form, evaluated with GitHub's operators: && and || return an
 # operand (first falsy / first truthy), like Python's `and` / `or`, and '' and
 # null are falsy in both. The template is taken from the files (every read must
-# share it), translated token by token, and checked over every case.
+# share it), translated token by token, and checked over every case, each result
+# rendered as GitHub renders it into an input: null as '', false as 'false'.
 if command -v python3 >/dev/null 2>&1; then
-  check "the guarded form: openbao mode gives env.X or '', every other mode exactly what the old form gave" "python3 - '$NODE' '$DOCKER' '$PY' <<'EOF'
+  cat >"$tmp/guarded_model.py" <<'EOF'
+# guarded_model.py <variant> <workflow>...: prints each case where the form
+# gives other than it must, exits 1 if there is one. variant: as-is, or
+# no-trailing-default (the form without its last || '').
 import re, sys
+variant, files = sys.argv[1], sys.argv[2:]
 templates = set()
-for f in sys.argv[1:]:
+for f in files:
     for line in open(f):
-        m = re.search(r\"\\$\\{\\{ (inputs\\.secrets-source == 'openbao' && env\\.([A-Z_]+) .*?) \\}\\}\", line)
-        if m:
+        for m in re.finditer(r"\$\{\{ (inputs\.secrets-source == 'openbao' && env\.([A-Z_]+) .*?) \}\}", line):
             templates.add(m.group(1).replace(m.group(2), 'X'))
 assert len(templates) == 1, templates
 t = templates.pop()
+if variant == 'no-trailing-default':
+    assert t.endswith(" || '')"), t
+    t = t[:-len(" || '')")] + ')'
 py = (t.replace('inputs.secrets-source', 'src').replace('env.X', 'env').replace('secrets.X', 'sec')
        .replace('&&', 'and').replace('||', 'or'))
 new = eval('lambda src, env, sec: ' + py)
 old = lambda src, env, sec: (src == 'openbao' and env) or sec
-show = lambda v: '' if v is None or v is False else v   # how GitHub renders null / false into a string input
+# How GitHub renders a value into a string input or env: null as '', a boolean
+# as 'true' / 'false', a string as itself. A form that can yield false passes
+# the string 'false' on: never empty.
+show = lambda v: '' if v is None else 'true' if v is True else 'false' if v is False else v
+bad = []
 for src in ('openbao', 'github', 'something-else'):
     for env in (None, '', 'from-openbao'):
         for sec in (None, '', 'from-github'):
             got = show(new(src, env, sec))
             want = show(env) if src == 'openbao' else show(old(src, env, sec))
-            assert got == want, (src, env, sec, got, want)
-EOF"
+            if got != want:
+                bad.append(f'src={src!r} env={env!r} sec={sec!r}: got {got!r}, want {want!r}')
+print('\n'.join(bad) or 'every case as it must be')
+sys.exit(1 if bad else 0)
+EOF
+  check "the guarded form: openbao mode gives env.X or '', every other mode exactly what the old form gave" \
+    "python3 '$tmp/guarded_model.py' as-is '$NODE' '$DOCKER' '$PY' >'$tmp/model.out' || (cat '$tmp/model.out'; false)"
+  # The model has to tell '' from false: without its trailing || '' the form
+  # yields false in openbao mode when env.X is empty, and GitHub passes 'false'.
+  check "  ...and the model fails the form without its trailing || '' (it renders false as 'false')" \
+    "! python3 '$tmp/guarded_model.py' no-trailing-default '$NODE' '$DOCKER' '$PY' >'$tmp/model.out' && grep -q \"^src='openbao' env='' sec='from-github': got 'false', want ''\$\" '$tmp/model.out'"
 else
   echo "SKIP - python3 not found (guarded-form evaluation)"
 fi
@@ -93,7 +114,6 @@ fi
 # The Check step: one text in all three workflows, run under every sh it can
 # meet, before every OpenBao read.
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
-  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
   STEP="Check secrets-source and openbao-tools"
   run_of "$DOCKER" docker "$STEP" >"$tmp/check.sh"
   check "$STEP: node-workflow.yml has the same text as docker-build.yml" "run_of '$NODE' node-ci '$STEP' | cmp -s - '$tmp/check.sh'"
