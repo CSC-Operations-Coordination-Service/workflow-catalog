@@ -25,6 +25,10 @@ check "action pins github-script by commit" "grep -Eq 'actions/github-script@[0-
 check "action reads devsecops/data/ci/<kind>/<tool>" "grep -q 'devsecops/data/ci/' '$ACT'"
 check "action logs in as <role>-release on tag builds" "grep -q \"REF_TYPE === 'tag'\" '$ACT' && grep -q -- '-release' '$ACT'"
 check "the ocs-layout steps run only without tools" "[ \"\$(grep -c \"if: inputs.tools == ''\\$\" '$ACT')\" = 2 ] && grep -q \"if: inputs.tools == '' && steps.login.outcome == 'failure'\" '$ACT'"
+check "action has a required-field list per tool (behaviour: tools test)" "grep -q 'const REQUIRED = {' '$ACT'"
+check "a failed ocs read lists the ocs/ci paths it needed" "grep -q 'paths=\"\$paths ocs/ci/shared/\$n\"' '$ACT'"
+# scripts/ci-secrets does not write devsecops/ci/<kind>/<tool> yet: nothing may say it does.
+check "the action does not name scripts/ci-secrets as the devsecops writer" "! grep -q 'scripts/ci-secrets writes' '$ACT' && grep -q 'does not write this layout yet' '$ACT'"
 
 # --- the workflows
 for f in "$NODE" "$DOCKER" "$PY"; do
