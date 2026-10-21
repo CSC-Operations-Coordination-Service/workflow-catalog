@@ -9,6 +9,11 @@ Applies to `node-workflow.yml`, `docker-build.yml` and `python-ci.yml`. Default
 behaviour is unchanged: without the inputs below every value still comes from
 `secrets.*`, as before.
 
+With `secrets-source: openbao`, OpenBao is the only source. A value it does not
+give is empty: the workflows never fall back to `secrets.*`, even with
+`secrets: inherit`. A gap in OpenBao stops the job where it is, instead of being
+filled quietly from a GitHub secret.
+
 ## What the caller sets
 
 | Input | Default | Purpose |
@@ -16,7 +21,7 @@ behaviour is unchanged: without the inputs below every value still comes from
 | `secrets-source` | `github` | `openbao` reads the values from OpenBao |
 | `openbao-url` | `https://openbao:8200` | Reachable from the runner pool only (overlay `ocs_openbao`) |
 | `openbao-role` | — | The repository's JWT role, e.g. `ci-ocs-operator-app` |
-| `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), space-separated on one line. Empty: every value from `ocs/ci/shared`, as before |
+| `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), separated by single spaces on one line (`nexus sonarqube`). An unknown name, a comma, a tab or a newline stops the job at the step "Check openbao-tools". Empty: every value from `ocs/ci/shared`, as before |
 | `runs-on` | `self-hosted` | Use `containerized` (a single label; the input is a string, not a list) |
 
 Two things the **caller job** must do, because a reusable workflow cannot grant
@@ -63,6 +68,26 @@ An operator writes them (`bao kv put ocs/ci/shared/NEXUS_PASSWORD value=-`), nev
 a pipeline. Roles and policies are in csc-ocs-ansible
 (`stacks/platform/openbao/openbao-config.yml`).
 
+The names each workflow reads from `ocs/ci/shared`, for a tool not listed in
+`openbao-tools`. Every name read must exist: one missing path stops the read,
+and the job's error lists the paths it needed.
+
+| Workflow | When | Names under `ocs/ci/shared` |
+| --- | --- | --- |
+| `node-workflow.yml` | `use-nexus-registry` | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` |
+| `node-workflow.yml` | `generate-sbom` | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` |
+| `docker-build.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `NEXUS_DOCKER_REGISTRY_DEV`, `NEXUS_DOCKER_REGISTRY_PROD` |
+| `docker-build.yml` | `push-to-dockerhub` | `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` |
+| `docker-build.yml` | `generate-sbom` | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` |
+| `docker-build.yml` | `sign-image` on a `release` build | `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` |
+| `python-ci.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `SONAR_TOKEN`, `SONAR_HOST_URL` |
+
+`python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`, and csc-ocs-ansible's
+`scripts/ci-secrets` does not write it. Until an operator stores it by hand, a
+`python-ci.yml` caller in openbao mode must list `sonarqube` in `openbao-tools`, so
+the URL and token come from `devsecops/ci/<dev|prod>/sonarqube`. Otherwise the
+`sonarqube` job stops at its OpenBao read.
+
 ### The devsecops layout (`openbao-tools`)
 
 kv-v2 mount `devsecops`, one secret per tool, its fields inside:
@@ -84,18 +109,38 @@ reverse).
 
 Each field arrives as the variable the workflows already read, masked:
 
-| Tool | Field → variable |
-| --- | --- |
-| `nexus` | `host` → `NEXUS_HOST`, `port` → `NEXUS_PORT`, `username` → `NEXUS_USERNAME`, `password` → `NEXUS_PASSWORD`, `docker_registry` → `NEXUS_DOCKER_REGISTRY_DEV` (dev) or `NEXUS_DOCKER_REGISTRY_PROD` (prod), `goproxy` → `GOPROXY` |
-| `sonarqube` | `url` → `SONAR_HOST_URL`, `token` → `SONAR_TOKEN` |
-| `dependency-track` | `url` → `DEPENDENCYTRACK_URL`, `api_key` → `DEPENDENCYTRACK_API_KEY` |
-| `dockerhub` | `username` → `DOCKERHUB_USERNAME`, `token` → `DOCKERHUB_TOKEN` |
-| `cosign` | `private_key` → `COSIGN_PRIVATE_KEY`, `password` → `COSIGN_PASSWORD` |
+| Tool | Field → variable | Required |
+| --- | --- | --- |
+| `nexus` | `host` → `NEXUS_HOST`, `port` → `NEXUS_PORT`, `username` → `NEXUS_USERNAME`, `password` → `NEXUS_PASSWORD`, `docker_registry` → `NEXUS_DOCKER_REGISTRY_DEV` (dev) or `NEXUS_DOCKER_REGISTRY_PROD` (prod), `goproxy` → `GOPROXY` | all but `goproxy` |
+| `sonarqube` | `url` → `SONAR_HOST_URL`, `token` → `SONAR_TOKEN` | both |
+| `dependency-track` | `url` → `DEPENDENCYTRACK_URL`, `api_key` → `DEPENDENCYTRACK_API_KEY` | both |
+| `dockerhub` | `username` → `DOCKERHUB_USERNAME`, `token` → `DOCKERHUB_TOKEN` | both |
+| `cosign` | `private_key` → `COSIGN_PRIVATE_KEY`, `password` → `COSIGN_PASSWORD` | both |
 
-This map is the contract with csc-ocs-ansible, whose `scripts/ci-secrets` writes
-the secrets: change both together. A field missing from a secret is not
-exported, and other fields are ignored. A listed tool whose secret cannot be read
-stops the job: it is never skipped.
+A required field that is absent, blank, or not a string or number stops the job
+before anything is exported. The error names the path and the fields, never a
+value. `goproxy` is the one optional field: only Go builds use it. Other fields
+are ignored. A listed tool whose secret cannot be read stops the job: it is never
+skipped.
+
+`docker-build.yml` reads `cosign` only on a `release` build with `sign-image`,
+the only builds that sign. A branch build never needs a signing key in
+`devsecops/ci/dev`.
+
+This map is the contract with csc-ocs-ansible: change both together. Its
+`scripts/ci-secrets` does not write this layout yet. Until it does, an operator
+writes each secret by hand with `bao kv put -mount=devsecops ci/<dev|prod>/<tool> ...`.
+A secret value goes in from stdin (`field=-`, typed or piped, one per command)
+or from a file (`field=@path`), never as an argument, where the shell history
+and the process list would keep it. For example:
+
+```bash
+bao kv put -mount=devsecops ci/dev/sonarqube url=<url> token=-
+bao kv put -mount=devsecops ci/prod/cosign private_key=@cosign.key password=-
+```
+
+`bao kv put` replaces the whole secret. To add one field to an existing secret,
+use `bao kv patch` with the same form.
 
 ### Test it from a pilot repository
 
@@ -124,7 +169,9 @@ jobs:
    the image build's environment to `prod` (`docker-environment: prod` here).
 3. Expected failures, worth seeing once: a branch build with
    `docker-environment: prod` stops at the read; a tool whose secret does not
-   exist stops the job naming its path.
+   exist stops the job naming its path; a secret without one of its required
+   fields stops the job naming the path and the field; a misspelled tool in
+   `openbao-tools` stops the job at "Check openbao-tools".
 
 Before the branch is merged, every `@ci/devsecops-secrets` ref inside the
 catalog goes back to `@develop`, and the pilots move to `@develop` with it.
