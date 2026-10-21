@@ -7,6 +7,7 @@ ACT="$ROOT/.github/actions/openbao-secrets/action.yml"
 NODE="$ROOT/.github/workflows/node-workflow.yml"
 DOCKER="$ROOT/.github/workflows/docker-build.yml"
 PY="$ROOT/.github/workflows/python-ci.yml"
+SBOM="$ROOT/.github/workflows/sbom.yml"
 fail=0
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 check() { if eval "$2"; then echo "ok   - $1"; else echo "FAIL - $1"; fail=1; fi; }
@@ -69,6 +70,19 @@ check "  ...the patterns catch what they are for" \
   "guard_catches '$PRIVATE' 'see x''x-ansible' && guard_catches '$PRIVATE' 'ci''-secrets' && guard_catches '$PRIVATE' 'ci''_secrets' && guard_catches '$PRIVATE' 'stacks''/abc/x' && guard_catches '$PRIVATE' 'aaa-bbbb-cccc''-02.example' && guard_catches '$ROLE' 'role ci-abc''-def-ghi'"
 check "  ...and leave the public forms alone" \
   "! guard_catches '$PRIVATE' \"the platform repository's CI-secrets tool, ci-<repo>, dev.ocs-registry.local\" && ! guard_catches '$ROLE' 'ci-<repo>-sign, <openbao-role>-release, tok-ci-x-sign'"
+# The openbao mode is for any repository with a JWT role, public or private. The
+# text that kept it to private repositories (copied from one workflow to the
+# next) does not come back.
+ONLY_PRIVATE='for (a )?private repositor|\(private repositories\)|cannot use organi[sz]ation secrets'
+check "no text keeps the openbao mode to private repositories" "none_of '$ONLY_PRIVATE' .github docs README.md"
+check "  ...the pattern catches that text, and leaves 'public or private' alone" \
+  "guard_catches '$ONLY_PRIVATE' 'for private ''repositories that' && guard_catches '$ONLY_PRIVATE' 'OpenBao (private ''repositories)' && ! guard_catches '$ONLY_PRIVATE' 'in any repository, public or private, that has'"
+# A fork's pull request gets no OIDC token, except through the events a fork can
+# start that run in the base repository's context. The doc names that class by
+# several of its events, never one event as "the exception".
+DOC="$ROOT/docs/openbao-secrets.md"
+check "docs/openbao-secrets.md names the base-context events a fork can start, not pull_request_target alone" \
+  "grep -q 'pull_request_target' '$DOC' && grep -q 'workflow_run' '$DOC' && grep -q 'issue_comment' '$DOC' && ! grep -q 'is the exception' '$DOC'"
 
 # --- the workflows
 # Reads of a managed value that are NOT in the guarded form
@@ -95,6 +109,15 @@ check "unguarded(): flags an unguarded \${{ }} after a guarded one on the same l
 check "unguarded(): flags secrets.X inside the same \${{ }} as a guarded form" u_inside
 check "unguarded(): flags an if: without \${{ }}" u_bare_if
 check "unguarded(): flags a guarded form whose env.X and secrets.X differ" u_mixed
+# The other half: reads of env.X outside the guarded form. env.X alone is the
+# openbao value only, so a caller in github mode (the default) gets '' there.
+# unguarded() cannot see it: such a line names no secrets.X.
+env_only() { sed -E "s/$GUARDED//g" "$1" | grep -En "env\.($MANAGED)\b"; }
+flags_env() { printf '%s\n' "$1" >"$tmp/env_only.yml"; [ -n "$(env_only "$tmp/env_only.yml")" ]; }
+e_clean() { ! flags_env "a: \${{ $G }}" && ! flags_env "a: \${{ env.NEXUS_DOCKER_REGISTRY }}"; }
+e_alone() { flags_env "a: \${{ env.NEXUS_HOST }}" && flags_env "a: \${{ $G }}/\${{ env.NEXUS_PORT }}"; }
+check "env_only(): a guarded read, and an env value the workflows set themselves, are clean" e_clean
+check "env_only(): flags env.X read alone, also next to a guarded read" e_alone
 # Step text as YAML sees it: run_of <workflow> <job> <step name>
 run_of() { python3 - "$1" "$2" "$3" <<'EOF'
 import sys, yaml
@@ -102,14 +125,18 @@ steps = yaml.safe_load(open(sys.argv[1]))["jobs"][sys.argv[2]]["steps"]
 print([s for s in steps if s.get("name") == sys.argv[3]][0]["run"], end="")
 EOF
 }
-for f in "$NODE" "$DOCKER" "$PY"; do
+for f in "$NODE" "$DOCKER" "$PY" "$SBOM"; do
   n="$(basename "$f")"
   check "$n: secrets-source input defaults to github" "grep -A16 '^      secrets-source:' '$f' | grep -q 'default: github'"
   check "$n: has openbao-url and openbao-role inputs" "grep -q '^      openbao-url:' '$f' && grep -q '^      openbao-role:' '$f'"
-  check "$n: every managed secret keeps its secrets.* fallback behind the switch" \
+  # Only the lines that still read secrets.X: that each consuming input still
+  # has one is pinned below ("github mode is pinned").
+  check "$n: every line that reads a managed secret also tests secrets-source" \
     "! grep -En 'secrets\.($MANAGED)' '$f' | grep -v 'secrets-source'"
   check "$n: in openbao mode no value falls back to secrets.* (every read is the guarded form)" \
     "grep -Eq 'secrets\.($MANAGED)' '$f' && [ -z \"\$(unguarded '$f')\" ] || (unguarded '$f'; false)"
+  check "$n: in github mode no value is read from env.* alone (every read is the guarded form)" \
+    "[ -z \"\$(env_only '$f')\" ] || (env_only '$f'; false)"
   check "$n: a 'Check secrets-source and openbao-tools' step runs under sh" \
     "grep -A1 '^      - name: Check secrets-source and openbao-tools\$' '$f' | grep -qx '        shell: sh'"
   check "$n: logs in only when secrets-source is openbao" "grep -q \"inputs.secrets-source == 'openbao'\" '$f'"
@@ -160,26 +187,223 @@ print('\n'.join(bad) or 'every case as it must be')
 sys.exit(1 if bad else 0)
 EOF
   check "the guarded form: openbao mode gives env.X or '', every other mode exactly what the old form gave" \
-    "python3 '$tmp/guarded_model.py' as-is '$NODE' '$DOCKER' '$PY' >'$tmp/model.out' || (cat '$tmp/model.out'; false)"
+    "python3 '$tmp/guarded_model.py' as-is '$NODE' '$DOCKER' '$PY' '$SBOM' >'$tmp/model.out' || (cat '$tmp/model.out'; false)"
   # The model has to tell '' from false: without its trailing || '' the form
   # yields false in openbao mode when env.X is empty, and GitHub passes 'false'.
   check "  ...and the model fails the form without its trailing || '' (it renders false as 'false')" \
-    "! python3 '$tmp/guarded_model.py' no-trailing-default '$NODE' '$DOCKER' '$PY' >'$tmp/model.out' && grep -q \"^src='openbao' env='' sec='from-github': got 'false', want ''\$\" '$tmp/model.out'"
+    "! python3 '$tmp/guarded_model.py' no-trailing-default '$NODE' '$DOCKER' '$PY' '$SBOM' >'$tmp/model.out' && grep -q \"^src='openbao' env='' sec='from-github': got 'false', want ''\$\" '$tmp/model.out'"
 else
   echo "SKIP - python3 not found (guarded-form evaluation)"
 fi
 
-# The Check step: one text in all three workflows, run under every sh it can
+# --- github mode is pinned: each input that takes a managed value holds the
+# guarded form of its own value, so a caller with the default secrets-source
+# still gets secrets.X there. The checks above read the text that names a
+# managed value: an input turned into a literal, dropped, or given another
+# value's guarded form (nexus-port reading NEXUS_HOST) names nothing wrong and
+# passes them. PINNED: input or env name -> the value it carries, wherever a
+# step of the four workflows sets it. ACTIONS: each step that uses one of these
+# actions sets all of its inputs. STEPS: how many such steps each workflow has,
+# so that a step gone whole is seen too.
+if python3 -c 'import yaml' 2>/dev/null; then
+  cat >"$tmp/pinned.py" <<'EOF'
+# pinned.py <workflow>...: prints each pinned input that is not the guarded form
+# of its own value, each input an action does not get, and each workflow with
+# another number of consuming steps; exits 1 if there is one. Names only.
+import os, sys, yaml
+G = "${{ inputs.secrets-source == 'openbao' && env.%(x)s || (inputs.secrets-source != 'openbao' && secrets.%(x)s || '') }}"
+NEXUS = {"nexus-host": "NEXUS_HOST", "nexus-port": "NEXUS_PORT",
+         "nexus-username": "NEXUS_USERNAME", "nexus-password": "NEXUS_PASSWORD"}
+DT = {"server-url": "DEPENDENCYTRACK_URL", "api-key": "DEPENDENCYTRACK_API_KEY"}
+# python-ci.yml's env consumers, one value each. docker-build.yml's username and
+# password inputs stand for several values: only the checks above cover them.
+ENV = {"SONAR_TOKEN": "SONAR_TOKEN", "SONAR_HOST_URL": "SONAR_HOST_URL",
+       "TWINE_USERNAME": "NEXUS_USERNAME", "TWINE_PASSWORD": "NEXUS_PASSWORD"}
+PINNED = {**NEXUS, **DT, **ENV}
+ACTIONS = {"/actions/nexus-context@": NEXUS, "/actions/npm-context@": NEXUS,
+           "/actions/dependency-track-upload@": DT}
+STEPS = {"node-workflow.yml": 2, "docker-build.yml": 1, "python-ci.yml": 2, "sbom.yml": 2}
+bad = []
+for f in sys.argv[1:]:
+    n = os.path.basename(f)
+    steps = 0
+    for job, j in yaml.safe_load(open(f))["jobs"].items():
+        for s in j.get("steps") or []:
+            at = "%s %s '%s'" % (n, job, s.get("name"))
+            for block in ("with", "env"):
+                for k, v in (s.get(block) or {}).items():
+                    if k in PINNED and v != G % {"x": PINNED[k]}:
+                        bad.append("%s: %s is not the guarded form of %s" % (at, k, PINNED[k]))
+            for ref, want in ACTIONS.items():
+                if ref in s.get("uses", ""):
+                    steps += 1
+                    bad += ["%s: no %s" % (at, k) for k in want if k not in (s.get("with") or {})]
+    if steps != STEPS[n]:
+        bad.append("%s: %d steps take Nexus or Dependency-Track inputs, %d expected" % (n, steps, STEPS[n]))
+print("\n".join(bad) or "every pinned input holds the guarded form of its own value")
+sys.exit(1 if bad else 0)
+EOF
+  pinned() { python3 "$tmp/pinned.py" "$@"; }
+  check "github mode is pinned: each Nexus and Dependency-Track input, and python-ci's SonarQube and twine env, is the guarded form of its own value" \
+    "pinned '$NODE' '$DOCKER' '$PY' '$SBOM' >'$tmp/pinned.out' || (cat '$tmp/pinned.out'; false)"
+  # The pin on itself, on copies of the workflows edited the ways that break a
+  # github-mode caller. mutate <workflow> <sed -E script>: the edited copy, in
+  # $M under the same name. It must differ from the original, or the sample
+  # proves nothing.
+  M="$tmp/mut"; mkdir -p "$M"
+  mutate() { sed -E "$2" "$1" >"$M/$(basename "$1")" && ! cmp -s "$1" "$M/$(basename "$1")"; }
+  # pin_refuses <copy> <message ERE>: the pin fails that copy, with that message.
+  # Its output goes through a file: this script runs under pipefail.
+  pin_refuses() { ! pinned "$1" >"$M/pinned.out" && grep -Eq -- "$2" "$M/pinned.out"; }
+  p_env()     { mutate "$SBOM" 's/^(          server-url: ).*/\1${{ env.DEPENDENCYTRACK_URL }}/' && [ -z "$(unguarded "$M/sbom.yml")" ] && pin_refuses "$M/sbom.yml" 'server-url is not the guarded form of DEPENDENCYTRACK_URL$' && [ -n "$(env_only "$M/sbom.yml")" ]; }
+  p_py_env()  { mutate "$PY" 's/^(          nexus-host: ).*/\1${{ env.NEXUS_HOST }}/' && pin_refuses "$M/python-ci.yml" "'Set up Nexus context': nexus-host is not the guarded form of NEXUS_HOST\$" && [ -n "$(env_only "$M/python-ci.yml")" ]; }
+  p_literal() { mutate "$SBOM" 's|^(          server-url: ).*|\1https://dt.example|' && [ -z "$(env_only "$M/sbom.yml")" ] && pin_refuses "$M/sbom.yml" 'server-url is not the guarded form of DEPENDENCYTRACK_URL$'; }
+  p_swap()    { mutate "$SBOM" 's/^(          nexus-port: .*)NEXUS_PORT(.*)NEXUS_PORT/\1NEXUS_HOST\2NEXUS_HOST/' && [ -z "$(unguarded "$M/sbom.yml")" ] && pin_refuses "$M/sbom.yml" 'nexus-port is not the guarded form of NEXUS_PORT$'; }
+  p_dropped() { mutate "$SBOM" '/^          api-key: /d' && pin_refuses "$M/sbom.yml" "'Upload package SBOM to Dependency-Track': no api-key\$"; }
+  p_step()    { mutate "$PY" 's|(/actions/nexus-context)@|\1-renamed@|' && pin_refuses "$M/python-ci.yml" '^python-ci.yml: 0 steps take Nexus or Dependency-Track inputs, 2 expected$'; }
+  check "  ...and catches server-url read from env alone, which unguarded() lets through, as does env_only()" p_env
+  check "  ...and python-ci.yml's nexus-host read from env alone" p_py_env
+  check "  ...and an input turned into a literal" p_literal
+  check "  ...and an input given another value's guarded form, which unguarded() lets through" p_swap
+  check "  ...and an input dropped from its step" p_dropped
+  check "  ...and a consuming step gone" p_step
+else
+  echo "SKIP - python3 with PyYAML not found (github mode pin)"
+fi
+
+# --- openbao mode is pinned: each OpenBao read gets exactly the inputs it must.
+# The checks above see the form of a read (tools and shared chosen on the same
+# test, environment passed), not what it asks for: a name dropped from or
+# misspelled in its shared list, another tool in the result of its tools, or a
+# suffix on its role passes them all, and the job then gets an empty value, or
+# no login at all. READS: workflow, job and step -> the read's whole with:. Each
+# read of the four workflows must be in it, and each of its entries be found.
+# Apart from READS, a job's shared lists must give, together, exactly the
+# managed values the job reads in the guarded form (the Cosign key excepted: the
+# ocs layout never serves it), so that an entry and its workflow cannot go wrong
+# together unseen.
+if python3 -c 'import yaml' 2>/dev/null; then
+  cat >"$tmp/reads.py" <<'EOF'
+# reads.py <workflow>...: prints each OpenBao read whose with: is not as pinned,
+# each read the pin does not know or does not find, and each job whose shared
+# lists do not give what it reads; exits 1 if there is one. Names only.
+import os, re, sys, yaml
+def pick(tool, names):  # tools / shared of a read that chooses its layout on openbao-tools
+    return {"tools": "${{ contains(format(' {0} ', inputs.openbao-tools), ' %s ') && '%s' || '' }}" % (tool, tool),
+            "shared": "${{ !contains(format(' {0} ', inputs.openbao-tools), ' %s ') && '%s' || '' }}" % (tool, " ".join(names))}
+def env(name):  # the action's environment, from the workflow's own input
+    return {"environment": "${{ inputs.%s }}" % name}
+NEXUS = ["NEXUS_HOST", "NEXUS_PORT", "NEXUS_USERNAME", "NEXUS_PASSWORD"]
+REGISTRY = ["NEXUS_DOCKER_REGISTRY_DEV", "NEXUS_DOCKER_REGISTRY_PROD"]
+DT = ["DEPENDENCYTRACK_URL", "DEPENDENCYTRACK_API_KEY"]
+READS = {
+    ("node-workflow.yml", "node-ci", "Read secrets from OpenBao"): pick("nexus", NEXUS),
+    ("node-workflow.yml", "sbom-publish", "Read secrets from OpenBao"): pick("dependency-track", DT),
+    ("docker-build.yml", "docker", "Read secrets from OpenBao"): {**pick("nexus", NEXUS + REGISTRY), **env("environment")},
+    ("docker-build.yml", "docker", "Read Docker Hub secrets from OpenBao"): {**pick("dockerhub", ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"]), **env("environment")},
+    ("docker-build.yml", "docker", "Read Dependency-Track secrets from OpenBao"): {**pick("dependency-track", DT), **env("environment")},
+    ("docker-build.yml", "docker", "Read Cosign secrets from OpenBao"): {"tools": "cosign", **env("environment")},
+    ("python-ci.yml", "test", "Read Nexus secrets from OpenBao"): pick("nexus", NEXUS),
+    ("python-ci.yml", "sonarqube", "Read SonarQube secrets from OpenBao"): pick("sonarqube", ["SONAR_TOKEN", "SONAR_HOST_URL"]),
+    ("python-ci.yml", "build", "Read Nexus secrets from OpenBao"): pick("nexus", NEXUS),
+    ("sbom.yml", "sbom", "Read Nexus secrets from OpenBao"): {**pick("nexus", NEXUS), **env("context")},
+    ("sbom.yml", "publish", "Read Dependency-Track secrets from OpenBao"): {**pick("dependency-track", DT), **env("context")},
+}
+# Every read: the caller's URL, and the base role as given (the action adds
+# -release or -sign itself; a suffix here fails every login).
+COMMON = {"openbao-url": "${{ inputs.openbao-url }}", "role": "${{ inputs.openbao-role }}"}
+GUARDED = re.compile(r"inputs\.secrets-source == 'openbao' && env\.([A-Z_]+) \|\|")
+NAMES = re.compile(r"&& '([A-Z_ ]*)' \|\| '' \}\}$")
+def strings(o):  # every string in a step, keys and values
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield str(k); yield from strings(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from strings(v)
+    elif o is not None:
+        yield str(o)
+bad, seen = [], set()
+files = {os.path.basename(f): f for f in sys.argv[1:]}
+for n, f in files.items():
+    for job, j in yaml.safe_load(open(f))["jobs"].items():
+        given, used = set(), set()
+        for s in j.get("steps") or []:
+            used |= {x for t in strings(s) for x in GUARDED.findall(t)}
+            if "/actions/openbao-secrets@" not in s.get("uses", ""):
+                continue
+            key = (n, job, s.get("name"))
+            at = "%s %s '%s'" % key
+            w = s.get("with") or {}
+            if "shared" in w:
+                m = NAMES.search(str(w["shared"]))
+                if m:
+                    given |= set(m.group(1).split())
+                else:
+                    bad.append("%s: shared names no list of values" % at)
+            if key not in READS:
+                bad.append("%s: a read the pin does not know" % at)
+                continue
+            seen.add(key)
+            want = {**COMMON, **READS[key]}
+            bad += ["%s: no %s" % (at, k) for k in want if k not in w]
+            bad += ["%s: unexpected %s" % (at, k) for k in w if k not in want]
+            bad += ["%s: %s is not as pinned" % (at, k) for k in want if k in w and w[k] != want[k]]
+        used = {x for x in used if not x.startswith("COSIGN_")}
+        if used - given:
+            bad.append("%s %s: its shared lists do not give %s, which the job reads" % (n, job, " ".join(sorted(used - given))))
+        if given - used:
+            bad.append("%s %s: its shared lists give %s, which nothing in the job reads" % (n, job, " ".join(sorted(given - used))))
+bad += ["%s %s '%s': pinned read not found" % k for k in READS if k[0] in files and k not in seen]
+print("\n".join(bad) or "every OpenBao read gets its pinned inputs, and every job's shared lists give what it reads")
+sys.exit(1 if bad else 0)
+EOF
+  reads() { python3 "$tmp/reads.py" "$@"; }
+  check "openbao mode is pinned: each OpenBao read gets exactly its pinned inputs, and each job's shared lists give what it reads" \
+    "reads '$NODE' '$DOCKER' '$PY' '$SBOM' >'$tmp/reads.out' || (cat '$tmp/reads.out'; false)"
+  # The pin on itself, on copies edited the ways that break an openbao-mode
+  # caller and that every other check lets through (mutate: above).
+  # read_refuses <copy> <message ERE>...: the pin fails that copy, with each message.
+  read_refuses() {
+    local f="$1" re; shift
+    ! reads "$f" >"$M/reads.out" || return 1
+    for re in "$@"; do grep -Eq -- "$re" "$M/reads.out" || return 1; done
+  }
+  NX="sbom.yml sbom 'Read Nexus secrets from OpenBao'"
+  DTR="sbom.yml publish 'Read Dependency-Track secrets from OpenBao'"
+  r_drop()     { mutate "$SBOM" "s/^(          shared: .*NEXUS_USERNAME) NEXUS_PASSWORD'/\\1'/" && pinned "$M/sbom.yml" >/dev/null && read_refuses "$M/sbom.yml" "^$NX: shared is not as pinned\$" '^sbom.yml sbom: its shared lists do not give NEXUS_PASSWORD, which the job reads$'; }
+  r_typo()     { mutate "$SBOM" "s/^(          shared: .*)DEPENDENCYTRACK_API_KEY'/\\1DEPENDENCYTRACK_APIKEY'/" && read_refuses "$M/sbom.yml" "^$DTR: shared is not as pinned\$" '^sbom.yml publish: its shared lists do not give DEPENDENCYTRACK_API_KEY, which the job reads$' '^sbom.yml publish: its shared lists give DEPENDENCYTRACK_APIKEY, which nothing in the job reads$'; }
+  r_role()     { mutate "$SBOM" 's/^(          role: \$\{\{ inputs\.openbao-role \}\})$/\1-release/' && read_refuses "$M/sbom.yml" "^$NX: role is not as pinned\$" "^$DTR: role is not as pinned\$"; }
+  r_widen()    { mutate "$SBOM" "s/^(          tools: .*' nexus '\\) && )'nexus'/\\1'nexus dependency-track'/" && read_refuses "$M/sbom.yml" "^$NX: tools is not as pinned\$"; }
+  r_tool()     { mutate "$SBOM" "s/^(          tools: .*' dependency-track '\\) && )'dependency-track'/\\1'dependencytrack'/" && read_refuses "$M/sbom.yml" "^$DTR: tools is not as pinned\$"; }
+  r_extra()    { mutate "$SBOM" 's/^(          environment: \$\{\{ inputs\.context \}\})$/\1\n          repo: EXTRA/' && read_refuses "$M/sbom.yml" "^$NX: unexpected repo\$" "^$DTR: unexpected repo\$"; }
+  r_unknown()  { mutate "$SBOM" 's/^(      - name: Read Nexus secrets from OpenBao)$/\1 again/' && read_refuses "$M/sbom.yml" "^sbom.yml sbom 'Read Nexus secrets from OpenBao again': a read the pin does not know\$" "^$NX: pinned read not found\$"; }
+  r_py_drop()  { mutate "$PY" "s/^(          shared: .*NEXUS_USERNAME) NEXUS_PASSWORD'/\\1'/" && read_refuses "$M/python-ci.yml" "^python-ci.yml test 'Read Nexus secrets from OpenBao': shared is not as pinned\$" "^python-ci.yml build 'Read Nexus secrets from OpenBao': shared is not as pinned\$"; }
+  r_py_role()  { mutate "$PY" 's/^(          role: \$\{\{ inputs\.openbao-role \}\})$/\1-release/' && read_refuses "$M/python-ci.yml" "^python-ci.yml sonarqube 'Read SonarQube secrets from OpenBao': role is not as pinned\$"; }
+  check "  ...and catches a name dropped from sbom.yml's Nexus shared list, which the github-mode pin lets through" r_drop
+  check "  ...and a misspelled name in sbom.yml's Dependency-Track shared list" r_typo
+  check "  ...and a suffix on the role of sbom.yml's reads" r_role
+  check "  ...and another tool added to the result of sbom.yml's Nexus tools" r_widen
+  check "  ...and a misspelled tool in the result of sbom.yml's Dependency-Track tools" r_tool
+  check "  ...and an input the pin does not have" r_extra
+  check "  ...and a read the pin does not know, or a pinned read gone" r_unknown
+  check "  ...and python-ci.yml's Nexus shared lists and role, the same way" "r_py_drop && r_py_role"
+else
+  echo "SKIP - python3 with PyYAML not found (openbao mode pin)"
+fi
+
+# The Check step: one text in all four workflows, run under every sh it can
 # meet, before every OpenBao read.
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
   STEP="Check secrets-source and openbao-tools"
   run_of "$DOCKER" docker "$STEP" >"$tmp/check.sh"
   check "$STEP: node-workflow.yml has the same text as docker-build.yml" "run_of '$NODE' node-ci '$STEP' | cmp -s - '$tmp/check.sh'"
   check "$STEP: python-ci.yml has the same text as docker-build.yml" "run_of '$PY' test '$STEP' | cmp -s - '$tmp/check.sh'"
+  check "$STEP: sbom.yml has the same text as docker-build.yml" "run_of '$SBOM' sbom '$STEP' | cmp -s - '$tmp/check.sh'"
   # It guards every read only if it runs in every mode and first: in the job
   # that reads, or in a job that reading job needs (a failed need skips the job
   # unless its if: says always() or !cancelled()).
-  check "$STEP: runs under sh with no if:, before every OpenBao read" "python3 - '$NODE' '$DOCKER' '$PY' '$STEP' <<'EOF'
+  check "$STEP: runs under sh with no if:, before every OpenBao read" "python3 - '$NODE' '$DOCKER' '$PY' '$SBOM' '$STEP' <<'EOF'
 import sys, yaml
 *files, name = sys.argv[1:]
 for f in files:
@@ -321,6 +545,10 @@ assert got == (sign, release, '\${{ github.ref_type }}', environment), got" "$@"
     "python3 -c \"import sys, yaml
 step = [s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['test']['steps'] if s.get('name') == 'Check secrets-source and openbao-tools'][0]
 assert set(step['env']) == {'SECRETS_SOURCE', 'OPENBAO_TOOLS'}, sorted(step['env'])\" '$PY'"
+  check "Check step env: sbom.yml signs nothing, so passes none of the signing variables" \
+    "python3 -c \"import sys, yaml
+step = [s for s in yaml.safe_load(open(sys.argv[1]))['jobs']['sbom']['steps'] if s.get('name') == 'Check secrets-source and openbao-tools'][0]
+assert set(step['env']) == {'SECRETS_SOURCE', 'OPENBAO_TOOLS'}, sorted(step['env'])\" '$SBOM'"
 
   # python-ci's SonarQube preflight names the OpenBao path of an empty value.
   run_of "$PY" sonarqube "Check SonarQube URL and token" >"$tmp/sonar.sh"
@@ -369,6 +597,48 @@ check "node-workflow.yml and python-ci.yml read no Cosign value from OpenBao" "!
 check "docker-build.yml: runs-on is an input, default self-hosted" "grep -A4 '^      runs-on:' '$DOCKER' | grep -q 'default: self-hosted' && ! grep -q '^    runs-on: self-hosted' '$DOCKER'"
 check "node-workflow.yml: no job hardcodes self-hosted" "! grep -q '^    runs-on: self-hosted' '$NODE'"
 check "node-workflow.yml: container job joins the openbao network only in openbao mode" "grep -q -- '--network ocs_openbao' '$NODE' && grep -B2 -- '--network ocs_openbao' '$NODE' | grep -q 'secrets-source'"
+
+# sbom.yml: its `context` input picks the Nexus repositories, and every read
+# passes the same input as the action's environment, which the action checks
+# against the build kind (behaviour: tests/openbao_secrets_tools_test.sh). So a
+# tag build reads prod and any other build dev, or the job stops at the read.
+check "sbom.yml: every read passes context as environment for the build-kind check" \
+  "[ \"\$(grep -c '^          tools: ' '$SBOM')\" -gt 0 ] && [ \"\$(grep -c '^          tools: ' '$SBOM')\" = \"\$(grep -c '^          environment: \${{ inputs.context }}\$' '$SBOM')\" ]"
+check "sbom.yml: runs-on is an input, default self-hosted" "grep -A4 '^      runs-on:' '$SBOM' | grep -q 'default: self-hosted' && ! grep -q '^    runs-on: self-hosted' '$SBOM'"
+check "sbom.yml: its container job joins the openbao network only in openbao mode" "[ \"\$(grep -c -- \"secrets-source == 'openbao' && '--network ocs_openbao' || ''\" '$SBOM')\" = 1 ]"
+check "sbom.yml reads no Cosign value from OpenBao" "! grep -q \"' cosign '\" '$SBOM' && ! grep -q 'COSIGN_' '$SBOM'"
+if python3 -c 'import yaml' 2>/dev/null; then
+  # Each read right before the step that uses its values, in openbao mode only,
+  # with context as environment; the Nexus context from that same input.
+  sbom_reads() { python3 - "$SBOM" <<'EOF'
+import sys, yaml
+jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
+for job, read, use, tool in (
+    ("sbom", "Read Nexus secrets from OpenBao", "Set up Nexus context", "nexus"),
+    ("publish", "Read Dependency-Track secrets from OpenBao", "Upload package SBOM to Dependency-Track", "dependency-track"),
+):
+    steps = jobs[job]["steps"]
+    names = [s.get("name") for s in steps]
+    r, u = names.index(read), names.index(use)
+    assert r + 1 == u, (job, read, r, use, u)
+    step = steps[r]
+    assert "/actions/openbao-secrets@" in step["uses"], step["uses"]
+    assert step["if"] == "inputs.secrets-source == 'openbao'", (job, step["if"])
+    w = step["with"]
+    assert w["environment"] == "${{ inputs.context }}", (job, w)
+    assert f"' {tool} ')" in w["tools"] and f"' {tool} ')" in w["shared"], (job, w)
+nexus = [s for s in jobs["sbom"]["steps"] if s.get("name") == "Set up Nexus context"][0]["with"]
+assert nexus["context"] == "${{ inputs.context }}", nexus["context"]
+# publish runs on the runner itself (an internal Dependency-Track is out of a
+# job container's reach), so it has no container to put on the overlay.
+assert "container" not in jobs["publish"], jobs["publish"].get("container")
+assert jobs["publish"].get("needs") == "sbom", jobs["publish"].get("needs")
+EOF
+  }
+  check "sbom.yml: each read sits right before the step that uses it, in openbao mode only, with context as environment" sbom_reads
+else
+  echo "SKIP - python3 with PyYAML not found (sbom.yml reads)"
+fi
 
 # --- protections that a later edit could undo without any other test noticing:
 # the https:// check on openbao-url, no ${{ }} in a script, and the masking of
@@ -446,12 +716,12 @@ fi
 # --- one ref for everything this branch adds. A workflow that calls another catalog
 # workflow or the action at a different ref (e.g. @develop while the new inputs only
 # exist on the branch) is rejected by GitHub: "Invalid input, X is not defined".
-refs="$(grep -hoE 'workflow-catalog/\.github/(workflows/docker-build\.yml|actions/openbao-secrets)@[^ ]+' "$NODE" "$DOCKER" "$PY" | sed -E 's/.*@//' | sort -u)"
+refs="$(grep -hoE 'workflow-catalog/\.github/(workflows/docker-build\.yml|actions/openbao-secrets)@[^ ]+' "$NODE" "$DOCKER" "$PY" "$SBOM" | sed -E 's/.*@//' | sort -u)"
 check "docker-build.yml and the openbao-secrets action are called at one and the same ref" "[ \"\$(wc -l <<<\"\$refs\")\" = 1 ]"
 
 # --- actionlint
 if docker image inspect rhysd/actionlint:1.7.7 >/dev/null 2>&1 || docker pull -q rhysd/actionlint:1.7.7 >/dev/null 2>&1; then
-  check "actionlint is clean on the touched files" "docker run --rm -v '$ROOT:/r' -w /r rhysd/actionlint:1.7.7 -color=false .github/workflows/node-workflow.yml .github/workflows/docker-build.yml .github/workflows/python-ci.yml >/tmp/actionlint.out 2>&1 || (cat /tmp/actionlint.out; false)"
+  check "actionlint is clean on the touched files" "docker run --rm -v '$ROOT:/r' -w /r rhysd/actionlint:1.7.7 -color=false .github/workflows/node-workflow.yml .github/workflows/docker-build.yml .github/workflows/python-ci.yml .github/workflows/sbom.yml >/tmp/actionlint.out 2>&1 || (cat /tmp/actionlint.out; false)"
 else
   echo "SKIP - actionlint image unavailable"
 fi

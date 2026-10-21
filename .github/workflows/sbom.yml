@@ -9,7 +9,10 @@ name: Package SBOM (reusable)
 # Dependency-Track is not reachable from inside a job container).
 #
 # Pass secrets with `secrets: inherit`. Consumes these repository secrets:
-#   DEPENDENCYTRACK_URL, DEPENDENCYTRACK_API_KEY
+#   NEXUS_HOST, NEXUS_PORT, NEXUS_USERNAME, NEXUS_PASSWORD   (Nexus context, `sbom`)
+#   DEPENDENCYTRACK_URL, DEPENDENCYTRACK_API_KEY             (upload, `publish`)
+# or, with secrets-source: openbao, the same values from OpenBao only, never
+# from these secrets (docs/openbao-secrets.md).
 #
 # The image SBOM is produced separately inside docker-build.yml.
 
@@ -40,16 +43,66 @@ on:
         type: string
         default: "dist"
       context:
-        description: "Nexus context used to resolve any dependencies: 'dev' or 'prod'"
+        description: >
+          Nexus context used to resolve any dependencies: 'dev' or 'prod'. In
+          openbao mode it must match the build, as docker-build.yml's
+          `environment` does: prod on a tag build, dev on any other. Each read
+          of a tool listed in openbao-tools refuses a mismatch.
         required: false
         type: string
         default: "prod"
+      runs-on:
+        description: "Runner label of every job (e.g. containerized for the container runner pool)"
+        required: false
+        type: string
+        default: self-hosted
+
+      # --- secrets source -------------------------------------------------
+      secrets-source:
+        description: >
+          Where the Nexus and Dependency-Track values come from. `github`
+          (default): the repository/organization secrets, as before. `openbao`:
+          read them from OpenBao with the job's OIDC token (JWT auth), in any
+          repository, public or private, that has a JWT role there. Then
+          OpenBao is the only source: a value it does not give is empty, never
+          taken from secrets.* (even with `secrets: inherit`). `openbao` needs
+          `permissions: id-token: write` on the calling job, and the
+          containerized runner pool (runs-on: containerized).
+          Any other value stops the job.
+        required: false
+        type: string
+        default: github
+      openbao-url:
+        description: "OpenBao API URL (secrets-source: openbao)"
+        required: false
+        type: string
+        default: "https://openbao:8200"
+      openbao-role:
+        description: "OpenBao JWT role of this repository, ci-<repo> (secrets-source: openbao)"
+        required: false
+        type: string
+        default: ""
+      openbao-tools:
+        description: >
+          Tools whose values come from the devsecops layout
+          (devsecops/ci/<dev|prod>/<tool>) instead of ocs/ci/shared, separated by
+          single spaces on one line, e.g. "nexus dependency-track"; an unknown
+          name or any other separator stops the job. A tool not listed keeps the
+          ocs layout. Tag builds read prod and log in as <openbao-role>-release;
+          `context` must then be prod, and dev on any other build, or the job
+          stops at the read. Only with secrets-source: openbao.
+        required: false
+        type: string
+        default: ""
 
 jobs:
   sbom:
-    runs-on: self-hosted
+    runs-on: ${{ inputs.runs-on }}
     container:
       image: python:${{ inputs.python-version }}
+      # In openbao mode the job container also joins the overlay, to reach
+      # https://openbao:8200 (see node-workflow.yml `node-ci`).
+      options: ${{ inputs.secrets-source == 'openbao' && '--network ocs_openbao' || '' }}
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -57,14 +110,103 @@ jobs:
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # Runs before any OpenBao read, in every mode, under sh: a job container
+      # can be an Alpine image (node:<v>-alpine, python:<v>-alpine), without bash.
+      # secrets-source: every read tests == 'openbao', so any other value (a
+      # typo such as open-bao) would quietly read the GitHub secrets instead.
+      # openbao-tools is matched below with contains(' <tool> '), which takes a
+      # misspelled tool, or a list split by newlines, tabs or commas, for no
+      # tool at all: the read would quietly keep the ocs layout, out of reach of
+      # the action's own check for unknown tools. Refuse both here.
+      - name: Check secrets-source and openbao-tools
+        shell: sh
+        env:
+          SECRETS_SOURCE: ${{ inputs.secrets-source }}
+          OPENBAO_TOOLS: ${{ inputs.openbao-tools }}
+        run: |
+          set -eu
+          set -f
+          known="nexus sonarqube dependency-track dockerhub cosign"
+          # $1 on one line, for a message: newline, tab and CR spelled \n, \t, \r.
+          # printf, not echo: dash's echo would turn a \n back into a newline.
+          shown() { printf '%s\n' "$1" | awk '{ gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); s = s sep $0; sep = "\\n" } END { printf "%s", s }'; }
+          case $SECRETS_SOURCE in
+            github | openbao) ;;
+            *)
+              printf "::error::secrets-source must be 'github' (the default) or 'openbao', got '%s'.\n" "$(shown "$SECRETS_SOURCE")"
+              exit 1 ;;
+          esac
+          if [ "$SECRETS_SOURCE" != openbao ]; then
+            echo "secrets-source: $SECRETS_SOURCE"
+            exit 0
+          fi
+          # One line, one space between names: the only form the matchers see.
+          # The letters are spelled out: in some locales a-z takes in capitals.
+          # An empty list passes both checks.
+          case $OPENBAO_TOOLS in
+            ' '* | *' ' | *'  '* | *[!abcdefghijklmnopqrstuvwxyz\ -]*)
+              printf "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got '%s'). Known: %s.\n" "$(shown "$OPENBAO_TOOLS")" "$known"
+              exit 1 ;;
+          esac
+          for t in $OPENBAO_TOOLS; do
+            case " $known " in
+              *" $t "*) ;;
+              *) printf "::error::Unknown tool '%s' in openbao-tools. Known: %s.\n" "$t" "$known"; exit 1 ;;
+            esac
+          done
+          # Signing in openbao mode reads the key from the devsecops layout only,
+          # alone, with the <openbao-role>-sign role, right before the signing
+          # step: the ocs/ci/shared layout never serves it, the role is bound to
+          # tag builds, and the action refuses a tag build whose environment is
+          # not prod (a tag build reads prod values only). All three refused
+          # here, before anything is built, not at the signing step with the
+          # image already pushed: with nexus not in openbao-tools, the Cosign
+          # read is the first read that checks the environment. SIGN_IMAGE,
+          # RELEASE, REF_TYPE and ENVIRONMENT are set where an image is signed
+          # (docker-build.yml, and node-workflow.yml for its image build), unset
+          # elsewhere.
+          if [ "${SIGN_IMAGE:-false}" = true ] && [ "${RELEASE:-false}" = true ]; then
+            case " $OPENBAO_TOOLS " in
+              *" cosign "*) ;;
+              *)
+                printf "::error::sign-image on a release build in openbao mode needs cosign in openbao-tools (got '%s'). Signing in openbao mode reads the key with the <openbao-role>-sign role, from the devsecops layout only, right before the signing step; ocs/ci/shared does not serve it. Add cosign to openbao-tools.\n" "$OPENBAO_TOOLS"
+                exit 1 ;;
+            esac
+            if [ "${REF_TYPE:-}" != tag ]; then
+              printf "::error::sign-image on a release build in openbao mode signs tag builds only, and this is a '%s' build: the <openbao-role>-sign role that reads the key is bound to tag builds. Push a version tag, or turn off sign-image or release for this build.\n" "${REF_TYPE:-}"
+              exit 1
+            fi
+            if [ "${ENVIRONMENT:-}" != prod ]; then
+              printf "::error::sign-image on a release build in openbao mode needs the image build's environment to be prod (got '%s'): it signs tag builds only, a tag build reads prod values only, and the Cosign read, right before the signature, would refuse any other environment after the image is pushed. Set environment: prod (docker-environment: prod for node-workflow.yml).\n" "$(shown "${ENVIRONMENT:-}")"
+              exit 1
+            fi
+          fi
+          echo "secrets-source: openbao, openbao-tools: ${OPENBAO_TOOLS:-none}"
+
+
+      # Exactly one of tools / shared is set: the devsecops layout when the
+      # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
+      # `context` goes to the action as its environment: with nexus listed, a
+      # context that disagrees with the build (prod on a branch, dev on a tag)
+      # stops the job here, before anything is installed.
+      - name: Read Nexus secrets from OpenBao
+        if: inputs.secrets-source == 'openbao'
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' nexus ') && 'nexus' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' nexus ') && 'NEXUS_HOST NEXUS_PORT NEXUS_USERNAME NEXUS_PASSWORD' || '' }}
+          environment: ${{ inputs.context }}
+
       - name: Set up Nexus context
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ inputs.context }}
-          nexus-host: ${{ secrets.NEXUS_HOST }}
-          nexus-port: ${{ secrets.NEXUS_PORT }}
-          nexus-username: ${{ secrets.NEXUS_USERNAME }}
-          nexus-password: ${{ secrets.NEXUS_PASSWORD }}
+          nexus-host: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_HOST || '') }}
+          nexus-port: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PORT || '') }}
+          nexus-username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          nexus-password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
 
       - name: Download dist artifact
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
@@ -122,11 +264,16 @@ jobs:
   #
   # Only the SBOM file crosses over, via the artifact the job above uploaded —
   # no checkout, no Python, no Nexus context needed here. With no checkout the
-  # composite action below must stay referenced as owner/repo/path@ref (a local
+  # composite actions below must stay referenced as owner/repo/path@ref (a local
   # ./.github/actions/... path would resolve against an empty workspace).
+  #
+  # In openbao mode the OpenBao read below runs on the runner itself, like
+  # node-workflow.yml's `sbom-publish`: no container, so no --network to add.
+  # The "Check secrets-source and openbao-tools" step of `sbom`, which this job
+  # needs, has already vetted secrets-source and openbao-tools.
   publish:
     needs: sbom
-    runs-on: self-hosted
+    runs-on: ${{ inputs.runs-on }}
 
     steps:
       - name: Download package SBOM
@@ -135,11 +282,24 @@ jobs:
           name: sbom-${{ inputs.project-name }}-package
           path: sbom
 
+      # As in `sbom`: tools or shared from openbao-tools, and `context` as the
+      # environment, so a dev build reads devsecops/ci/dev/dependency-track and
+      # a tag build devsecops/ci/prod/dependency-track, never the other.
+      - name: Read Dependency-Track secrets from OpenBao
+        if: inputs.secrets-source == 'openbao'
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        with:
+          openbao-url: ${{ inputs.openbao-url }}
+          role: ${{ inputs.openbao-role }}
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'dependency-track' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'DEPENDENCYTRACK_URL DEPENDENCYTRACK_API_KEY' || '' }}
+          environment: ${{ inputs.context }}
+
       - name: Upload package SBOM to Dependency-Track
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
         with:
           bom-file: sbom/sbom-python.cdx.json
           project-name: ${{ inputs.project-name }}
           project-version: ${{ inputs.project-version }}
-          server-url: ${{ secrets.DEPENDENCYTRACK_URL }}
-          api-key: ${{ secrets.DEPENDENCYTRACK_API_KEY }}
+          server-url: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_URL || (inputs.secrets-source != 'openbao' && secrets.DEPENDENCYTRACK_URL || '') }}
+          api-key: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_API_KEY || (inputs.secrets-source != 'openbao' && secrets.DEPENDENCYTRACK_API_KEY || '') }}

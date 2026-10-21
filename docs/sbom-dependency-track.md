@@ -45,6 +45,82 @@ workflow via `secrets: inherit`):
 | `DEPENDENCYTRACK_URL`     | Base URL of the Dependency-Track API server (no trailing `/api`), e.g. `http://host.docker.internal:8081`. Must be reachable from the self-hosted runners, the same way Nexus is. |
 | `DEPENDENCYTRACK_API_KEY` | A Dependency-Track team API key. For upload-only, it needs **`BOM_UPLOAD`**, **`PROJECT_CREATION_UPLOAD`**, and **`VIEW_PORTFOLIO`**. |
 
+`sbom.yml` also reads `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME` and
+`NEXUS_PASSWORD` for its Nexus context (the `sbom` job installs the wheel and
+tox through Nexus). Or, with `secrets-source: openbao`, all six values come
+from OpenBao instead: [below](#secrets-from-openbao).
+
+## Inputs of `sbom.yml`
+
+| Input | Default | Purpose |
+| --- | --- | --- |
+| `project-dir` | `python-demo` | Directory holding the package (`tox.ini` with a `sbom` env) |
+| `project-name` | — (required) | Dependency-Track project name, kept stable across releases |
+| `project-version` | — (required) | Dependency-Track project version, usually the release version |
+| `python-version` | `3.11` | Python image of the `sbom` job |
+| `artifact-name` | `dist` | Distribution artifact to download (the one `python-ci.yml` uploads) |
+| `context` | `prod` | Nexus context for the dependencies, `dev` or `prod`. In openbao mode it must match the build: `prod` on a tag build, `dev` on any other |
+| `runs-on` | `self-hosted` | Runner label of both jobs. `containerized` in openbao mode (a single label; the input is a string, not a list) |
+| `secrets-source` | `github` | `openbao`: read the Nexus and Dependency-Track values from OpenBao, and only from there (no fallback to `secrets.*`). Any value other than `github` or `openbao` stops the job at the step "Check secrets-source and openbao-tools", before any read |
+| `openbao-url` / `openbao-role` | `https://openbao:8200` / — | OpenBao address and this repository's JWT role, `ci-<repo>` (the base name) |
+| `openbao-tools` | — | Tools read from the devsecops layout instead of `ocs/ci/shared`: `nexus`, `dependency-track`, separated by single spaces on one line. An unknown name or another separator stops the job. See [openbao-secrets.md](openbao-secrets.md#the-devsecops-layout-openbao-tools) |
+
+## Secrets from OpenBao
+
+With `secrets-source: openbao`, the `sbom` job reads the four Nexus values and
+the `publish` job the two Dependency-Track values from OpenBao, with the job's
+GitHub OIDC token. The general rules, the two layouts and how an operator
+stores the values are in [openbao-secrets.md](openbao-secrets.md). What is
+particular to `sbom.yml`:
+
+```yaml
+jobs:
+  sbom:
+    needs: ci
+    permissions:
+      contents: read
+      id-token: write
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/sbom.yml@develop
+    with:
+      project-dir: .
+      project-name: <package>
+      project-version: ${{ needs.ci.outputs.version }}
+      context: ${{ github.ref_type == 'tag' && 'prod' || 'dev' }}
+      runs-on: containerized
+      secrets-source: openbao
+      openbao-role: ci-<repo>   # the repository's base role name
+      openbao-tools: nexus dependency-track
+    secrets: inherit
+```
+
+- **`context` follows the build.** A tag build reads
+  `devsecops/ci/prod/<tool>` and logs in as `<openbao-role>-release`, any other
+  build reads `devsecops/ci/dev/<tool>` as `<openbao-role>`. Each read passes
+  `context` to the action as its `environment`, so for a tool listed in
+  `openbao-tools` a `context` that disagrees stops the job at that read, before
+  the login. The default, `prod`, would stop every branch build that lists a
+  tool: pass the expression above. For a tool not listed, the `ocs/ci/shared`
+  names serve both contexts and nothing checks it.
+- **The caller job grants `id-token: write`.** `sbom.yml` has no
+  `permissions:` block of its own: it takes what the calling job grants.
+- **Where each job reaches OpenBao.** The `sbom` job's container joins the
+  `ocs_openbao` network in openbao mode. The `publish` job has no container
+  (see [Usage tips](#usage-tips)) and runs on the runner itself, which the
+  containerized pool already has on that network.
+- **The check runs once, first.** "Check secrets-source and openbao-tools", the
+  same step as in the other workflows, runs in the `sbom` job before its read.
+  `publish` needs `sbom`, so a refused input stops both before any read.
+- **An empty Dependency-Track value.** In the ocs layout an empty
+  `ocs/ci/shared/DEPENDENCYTRACK_URL` or `DEPENDENCYTRACK_API_KEY` is not
+  caught by the read. The upload then stops on `server-url is empty` or
+  `api-key is empty`, and its message names the GitHub secret, but in openbao
+  mode the value comes from OpenBao. With `dependency-track` in
+  `openbao-tools`, the read itself stops on an empty field.
+
+While the openbao mode is tested on the catalog branch `ci/openbao-secrets`,
+call `sbom.yml` at that ref, as
+[openbao-secrets.md](openbao-secrets.md#test-it-from-a-pilot-repository) says.
+
 ## The shared primitives
 
 Two composite actions, split so either half can be swapped or reused alone:

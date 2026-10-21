@@ -1,13 +1,25 @@
-# Secrets from OpenBao (private repositories)
+# Secrets from OpenBao
 
-For private repositories that cannot use organization secrets, the catalog
-workflows can read the same values from OpenBao instead, with the job's own
-GitHub OIDC token: no vault token and no other secret is stored in the
-repository.
+Instead of repository or organization secrets, the catalog workflows can read
+the same values from OpenBao, with the job's own GitHub OIDC token: no vault
+token and no other secret is stored in the repository, and OpenBao is the one
+place an operator keeps them up to date. Any repository with a JWT role in
+OpenBao can use it, public or private.
 
-Applies to `node-workflow.yml`, `docker-build.yml` and `python-ci.yml`. Default
-behaviour is unchanged: without the inputs below every value still comes from
-`secrets.*`, as before.
+A public repository also runs its workflows for pull requests from forks.
+GitHub gives such a run a read-only token, and the OIDC token needs
+`id-token: write`, so it cannot log in to OpenBao, whatever the role allows.
+That is GitHub's documented behaviour, not yet tried here with a pull request
+from a fork. It does not hold for the events that a fork's pull request can
+start but that run in the base repository's context, with its token and
+permissions: `pull_request_target`, `workflow_run` (a run that follows the
+fork's workflow), and `issue_comment` on the pull request, for example. Such a
+run gets an OIDC token whenever its workflow grants `id-token: write`. Never
+call a workflow in openbao mode from any of them.
+
+Applies to `node-workflow.yml`, `docker-build.yml`, `python-ci.yml` and
+`sbom.yml`. Default behaviour is unchanged: without the inputs below every
+value still comes from `secrets.*`, as before.
 
 With `secrets-source: openbao`, OpenBao is the only source. A value it does not
 give is empty: the workflows never fall back to `secrets.*`, even with
@@ -95,6 +107,8 @@ without its value.
 | `docker-build.yml` | `generate-sbom` | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` |
 | `docker-build.yml` | `sign-image` on a `release` build | none: the signing key comes from the devsecops layout only, with `cosign` in `openbao-tools` ([the signing key](#the-signing-key-cosign)) |
 | `python-ci.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `SONAR_TOKEN`, `SONAR_HOST_URL` |
+| `sbom.yml` | always (job `sbom`) | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` |
+| `sbom.yml` | always (job `publish`) | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` |
 
 `python-ci.yml` needs `ocs/ci/shared/SONAR_HOST_URL`. The platform
 repository's CI-secrets tool stores it, in its default layout (it removes a
@@ -135,6 +149,17 @@ comes after the push. So when a build signs in openbao mode,
 "Check secrets-source and openbao-tools" refuses an `environment` other than
 `prod` itself, before anything is built. A build that does not sign, with no
 devsecops tool listed, is not checked: the ocs layout serves both registries.
+
+`sbom.yml`'s `context` input follows the same rule. Each of its reads passes
+`context` to the action as `environment`, so with `nexus` or
+`dependency-track` listed, a `context` that disagrees with the build stops the
+job at that read, before the login (the message names `environment`). The
+Nexus read comes before anything is installed. The default, `prod`, stops a
+branch build in openbao mode with a devsecops tool listed: pass `context` from
+the build kind, as in
+[sbom-dependency-track.md](sbom-dependency-track.md#secrets-from-openbao). With
+no tool listed nothing checks it, as above. `python-ci.yml` has no such input:
+it takes the context from the ref itself.
 
 Each field arrives as the variable the workflows already read, masked:
 
@@ -222,7 +247,7 @@ So `docker-build.yml` reads the key:
 `node-ci` job runs the same check first, before the Node build and the SBOM
 upload. Its image build is a job of `docker-build.yml`, which the `-sign` role
 is meant to accept; that rests on an assumption about nested calls, below.
-`python-ci.yml` signs nothing.
+`python-ci.yml` and `sbom.yml` sign nothing.
 
 What the platform repository's OpenBao configuration must hold (the catalog
 cannot check it):

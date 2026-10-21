@@ -103,7 +103,7 @@ set. The step logs which mode it used.
 
 ## Secrets
 
-Provide with `secrets: inherit` (or, for a private repository, `secrets-source: openbao`: [openbao-secrets.md](openbao-secrets.md)). Consumed only when the matching feature is enabled:
+Provide with `secrets: inherit` (or read them from OpenBao instead, with `secrets-source: openbao`: [openbao-secrets.md](openbao-secrets.md)). Consumed only when the matching feature is enabled:
 `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` (`use-nexus-registry`);
 `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` (SBOM); `NEXUS_DOCKER_REGISTRY_DEV/_PROD`,
 `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (image).

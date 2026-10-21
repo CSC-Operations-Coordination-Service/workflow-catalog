@@ -51,8 +51,8 @@ on:
         description: >
           Where the Nexus and SonarQube values come from. `github` (default):
           the repository/organization secrets, as before. `openbao`: read them
-          from OpenBao with the job's OIDC token (JWT auth), for private
-          repositories that cannot use organization secrets. Then OpenBao is the
+          from OpenBao with the job's OIDC token (JWT auth), in any repository,
+          public or private, that has a JWT role there. Then OpenBao is the
           only source: a value it does not give is empty, never taken from
           secrets.* (even with `secrets: inherit`). `openbao` needs
           `permissions: id-token: write` on the calling job, and the
