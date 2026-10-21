@@ -24,7 +24,8 @@ description: >
   exported under the name the workflows already read (map in the step below),
   masked. Every field but nexus's `goproxy` is required: a secret that lacks
   one, or holds it empty, stops the job before anything is exported. `repo`
-  names are read from the ocs layout with the same login.
+  names are read from the ocs layout with the same login, and an absent,
+  empty or blank `value` stops the job the same way.
 
   Runs on the containerized runner pool, where https://openbao:8200 resolves
   (the overlay `ocs_openbao`). A job with a `container:` is a sibling container
@@ -311,8 +312,13 @@ runs:
           }
           for (const name of words(env.OPENBAO_REPO)) {
             const label = `ocs/ci/${env.REPO_NAME}/${name}`;
-            const data = await read(`ocs/data/ci/${env.REPO_NAME}/${name}`, label, 'An operator stores it (csc-ocs-ansible scripts/ci-secrets, or bao kv put); a pipeline never writes it.');
-            if (typeof data.value !== 'string') throw new Error(`${label} has no string key 'value'.`);
+            const STORE = 'An operator stores it (csc-ocs-ansible scripts/ci-secrets, or bao kv put); a pipeline never writes it.';
+            const data = await read(`ocs/data/ci/${env.REPO_NAME}/${name}`, label, STORE);
+            // The rule of a required field: a blank value would only resurface
+            // later as an empty variable, far from its cause.
+            if (typeof data.value !== 'string' || data.value.trim() === '') {
+              throw new Error(`${label} has no usable key 'value' (absent, empty, blank, or not a string). Nothing was exported. ${STORE}`);
+            }
             pending.push({ label, vars: [[name, data.value]], ignored: [] });
           }
 

@@ -163,6 +163,15 @@ const allMasked = (o) => Object.values(o.exported).every((v) => o.masked.has(v))
   o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_REPO: 'EXTRA' });
   check('repo names are read from ocs/ci/<repo> with the same login', o.error === null && o.exported.EXTRA === 'extra-value' && o.masked.has('extra-value'));
 
+  // A repo name has one field, 'value', and the same rule as a required field.
+  o = await runWith({ 'ocs/data/ci/repo-x/EMPTY': { value: '' } }, { OPENBAO_TOOLS: 'nexus', OPENBAO_REPO: 'EMPTY' });
+  check("a repo name whose 'value' is empty stops the job, naming the path", /ocs\/ci\/repo-x\/EMPTY has no usable key 'value' \(/.test(o.error || ''));
+  check('  ...before anything is exported, even the tool read before it', o.requests.includes('GET /v1/devsecops/data/ci/dev/nexus') && Object.keys(o.exported).length === 0);
+  o = await runWith({ 'ocs/data/ci/repo-x/BLANK': { value: ' \n\t' } }, { OPENBAO_TOOLS: 'nexus', OPENBAO_REPO: 'BLANK' });
+  check("a repo name whose 'value' is blank stops the job", /ocs\/ci\/repo-x\/BLANK has no usable key 'value' \(/.test(o.error || '') && Object.keys(o.exported).length === 0);
+  o = await runWith({ 'ocs/data/ci/repo-x/NOVALUE': { other: 'x' } }, { OPENBAO_TOOLS: 'nexus', OPENBAO_REPO: 'NOVALUE' });
+  check("a repo name without the key 'value' stops the job", /ocs\/ci\/repo-x\/NOVALUE has no usable key 'value' \(/.test(o.error || '') && Object.keys(o.exported).length === 0);
+
   o = await run({ OPENBAO_TOOLS: 'nexus', OPENBAO_URL: 'https://localhost:1' });
   check('an unreachable OpenBao stops with the checklist', /cannot be reached.*SEALED/.test(o.error || ''));
 
