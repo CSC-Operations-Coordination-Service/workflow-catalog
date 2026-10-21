@@ -8,11 +8,21 @@ description: >
   job can only read what its role's policies allow. The calling job needs
   `permissions: id-token: write`.
 
-  Secrets live in the kv-v2 mount `ocs`, one secret per name, with the value in
-  the key `value`:
+  Two layouts, chosen per call: `tools` set means the devsecops layout,
+  otherwise the ocs layout. One call never mixes them (`tools` with `shared` is
+  refused).
+
+  ocs layout (kv-v2 mount `ocs`), one secret per name, value in the key `value`:
     shared  ->  ocs/ci/shared/<NAME>   (readable by every CI role)
     repo    ->  ocs/ci/<repository name>/<NAME>   (this repository's role only)
   and arrive as the environment variable <NAME>, masked in logs.
+
+  devsecops layout (kv-v2 mount `devsecops`), one secret per tool, fields
+  inside: devsecops/ci/<kind>/<tool>, where kind is `prod` on a tag build and
+  `dev` on every other build. A tag build logs in as `<role>-release`, any
+  other build as `<role>`: callers pass the base role name only. Each field is
+  exported under the name the workflows already read (map in the step below),
+  masked. `repo` names are read from the ocs layout with the same login.
 
   Runs on the containerized runner pool, where https://openbao:8200 resolves
   (the overlay `ocs_openbao`). A job with a `container:` is a sibling container
@@ -23,14 +33,31 @@ inputs:
     description: "OpenBao API URL, e.g. https://openbao:8200"
     required: true
   role:
-    description: "JWT role of this repository, e.g. ci-ocs-operator-app"
+    description: >
+      JWT role of this repository, e.g. ci-ocs-operator-app. With `tools`, the
+      base name: tag builds log in as `<role>-release`.
     required: true
   shared:
-    description: "Names under ocs/ci/shared, one per line."
+    description: "Names under ocs/ci/shared, separated by spaces or newlines. Not with `tools`."
     required: false
     default: ""
   repo:
-    description: "Names under ocs/ci/<this repository>, one per line."
+    description: "Names under ocs/ci/<this repository>, separated by spaces or newlines."
+    required: false
+    default: ""
+  tools:
+    description: >
+      Tools to read from the devsecops layout, separated by spaces or newlines:
+      nexus, sonarqube, dependency-track, dockerhub, cosign. Empty = the ocs
+      layout (`shared` / `repo`), exactly as before.
+    required: false
+    default: ""
+  environment:
+    description: >
+      Optional, with `tools` only: the caller's target environment (`dev` or
+      `prod`). It must agree with the build kind: prod values are readable from
+      tag builds only, and a tag build reads prod values only. A mismatch stops
+      the job before the login.
     required: false
     default: ""
   audience:
@@ -45,8 +72,10 @@ inputs:
 runs:
   using: composite
   steps:
+    # --- ocs layout: ocs/ci/shared/<NAME>, ocs/ci/<repo>/<NAME> ----------------
     - name: Build the secret mapping
       id: map
+      if: inputs.tools == ''
       shell: bash
       env:
         SHARED: ${{ inputs.shared }}
@@ -55,20 +84,20 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
+        # Split on any whitespace, so a caller can pass the names on one line
+        # (from an expression) or one per line (a block scalar). No globbing.
+        set -f
         {
           echo "secrets<<EOF_MAP"
-          while IFS= read -r n; do
-            n="${n//[[:space:]]/}"; [ -n "$n" ] && echo "ocs/data/ci/shared/${n} value | ${n}"
-          done <<<"$SHARED"
-          while IFS= read -r n; do
-            n="${n//[[:space:]]/}"; [ -n "$n" ] && echo "ocs/data/ci/${REPO_NAME}/${n} value | ${n}"
-          done <<<"$REPO"
+          for n in $SHARED; do echo "ocs/data/ci/shared/${n} value | ${n}"; done
+          for n in $REPO; do echo "ocs/data/ci/${REPO_NAME}/${n} value | ${n}"; done
           echo "EOF_MAP"
           echo "ca=$(base64 -w0 "${ACTION_PATH}/openbao-ca.crt")"
         } >> "$GITHUB_OUTPUT"
 
     - name: Log in to OpenBao and read the secrets
       id: login
+      if: inputs.tools == ''
       # The failure is reported by the next step, with a message that says what
       # to look at; continue-on-error only defers the stop.
       continue-on-error: true
@@ -84,9 +113,170 @@ runs:
         exportEnv: true
 
     - name: Stop if OpenBao could not be read
-      if: steps.login.outcome == 'failure'
+      if: inputs.tools == '' && steps.login.outcome == 'failure'
       shell: bash
       run: |
         echo "::error::OpenBao login or secret read failed at ${{ inputs.openbao-url }} (role ${{ inputs.role }})."
         echo "::error::Check, in order: is OpenBao SEALED (it is unsealed by hand after any restart)? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to ${{ github.repository }}? Do the secret names exist under ocs/ci?"
         exit 1
+
+    # --- devsecops layout: devsecops/ci/<dev|prod>/<tool> ----------------------
+    # Not vault-action: it fails on any selector that finds nothing, so a field
+    # an operator did not store (goproxy, say) would stop every build, and it
+    # cannot rename one secret's fields per tool. A script does the login and the
+    # reads itself, with Node's https and the bundled CA: the token never leaves
+    # this step, and every value is masked before it is exported.
+    - name: Log in to OpenBao and read the devsecops secrets
+      if: inputs.tools != ''
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      env:
+        OPENBAO_URL: ${{ inputs.openbao-url }}
+        OPENBAO_ROLE: ${{ inputs.role }}
+        OPENBAO_AUDIENCE: ${{ inputs.audience }}
+        OPENBAO_AUTH_PATH: ${{ inputs.auth-path }}
+        OPENBAO_TOOLS: ${{ inputs.tools }}
+        OPENBAO_SHARED: ${{ inputs.shared }}
+        OPENBAO_REPO: ${{ inputs.repo }}
+        OPENBAO_ENVIRONMENT: ${{ inputs.environment }}
+        REF_TYPE: ${{ github.ref_type }}
+        REF_NAME: ${{ github.ref_name }}
+        REPOSITORY: ${{ github.repository }}
+        REPO_NAME: ${{ github.event.repository.name }}
+        ACTION_PATH: ${{ github.action_path }}
+      with:
+        script: |
+          const fs = require('fs');
+          const https = require('https');
+          const path = require('path');
+          const env = process.env;
+          const words = (s) => [...new Set((s || '').split(/\s+/).filter(Boolean))];
+
+          // Build kind: a version tag publishes prod artifacts, anything else dev.
+          const kind = env.REF_TYPE === 'tag' ? 'prod' : 'dev';
+          const role = kind === 'prod' ? `${env.OPENBAO_ROLE}-release` : env.OPENBAO_ROLE;
+
+          // The contract with csc-ocs-ansible (scripts/ci-secrets writes these
+          // fields): field of devsecops/ci/<kind>/<tool> -> variable the
+          // workflows read. A field missing from the secret is not exported.
+          const MAP = {
+            nexus: {
+              host: 'NEXUS_HOST', port: 'NEXUS_PORT',
+              username: 'NEXUS_USERNAME', password: 'NEXUS_PASSWORD',
+              docker_registry: kind === 'prod' ? 'NEXUS_DOCKER_REGISTRY_PROD' : 'NEXUS_DOCKER_REGISTRY_DEV',
+              goproxy: 'GOPROXY',
+            },
+            sonarqube: { url: 'SONAR_HOST_URL', token: 'SONAR_TOKEN' },
+            'dependency-track': { url: 'DEPENDENCYTRACK_URL', api_key: 'DEPENDENCYTRACK_API_KEY' },
+            dockerhub: { username: 'DOCKERHUB_USERNAME', token: 'DOCKERHUB_TOKEN' },
+            cosign: { private_key: 'COSIGN_PRIVATE_KEY', password: 'COSIGN_PASSWORD' },
+          };
+
+          // --- refuse a bad request before talking to OpenBao
+          const tools = words(env.OPENBAO_TOOLS);
+          const unknown = tools.filter((t) => !(t in MAP));
+          if (unknown.length) {
+            throw new Error(`Unknown tool(s) in 'tools': ${unknown.join(', ')}. Known: ${Object.keys(MAP).join(', ')}.`);
+          }
+          if (words(env.OPENBAO_SHARED).length) {
+            throw new Error("Pass either 'tools' (devsecops layout) or 'shared' (ocs/ci/shared), not both in one call.");
+          }
+          const want = env.OPENBAO_ENVIRONMENT;
+          if (want && !['dev', 'prod'].includes(want)) {
+            throw new Error(`environment must be 'dev' or 'prod', got '${want}'.`);
+          }
+          if (want === 'prod' && kind !== 'prod') {
+            throw new Error(`environment is 'prod' but this is a ${env.REF_TYPE} build of '${env.REF_NAME}': prod credentials are readable from tag builds only. Build with environment: dev, or push a version tag.`);
+          }
+          if (want === 'dev' && kind === 'prod') {
+            throw new Error(`This is a tag build of '${env.REF_NAME}', which reads devsecops/ci/prod only, but environment is 'dev'. Set environment: prod for tag builds.`);
+          }
+
+          // --- HTTPS to OpenBao. Node's https ignores HTTPS_PROXY, which is what
+          // we want: openbao:8200 is on the overlay, never behind squid.
+          const base = env.OPENBAO_URL.replace(/\/+$/, '');
+          const ca = fs.readFileSync(path.join(env.ACTION_PATH, 'openbao-ca.crt'), 'utf8');
+          const call = (method, apiPath, { token, body } = {}) => new Promise((resolve, reject) => {
+            const data = body === undefined ? undefined : JSON.stringify(body);
+            const headers = { Accept: 'application/json' };
+            if (token) headers['X-Vault-Token'] = token;
+            if (data) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = Buffer.byteLength(data); }
+            const req = https.request(new URL(`${base}/v1/${apiPath}`), { method, ca, headers, timeout: 20000 }, (res) => {
+              let text = '';
+              res.setEncoding('utf8');
+              res.on('data', (c) => { text += c; });
+              res.on('end', () => {
+                let json = null;
+                try { json = text ? JSON.parse(text) : null; } catch (e) { json = null; }
+                resolve({ status: res.statusCode, json });
+              });
+            });
+            req.on('timeout', () => req.destroy(new Error('no answer within 20 s')));
+            req.on('error', reject);
+            if (data) req.write(data);
+            req.end();
+          });
+          const why = (r) => (r.json && Array.isArray(r.json.errors) && r.json.errors.length ? r.json.errors.join('; ') : `HTTP ${r.status}`);
+          const CHECKS = `Check, in order: is OpenBao SEALED (it is unsealed by hand after any restart)? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role '${role}' exist, bound to ${env.REPOSITORY}${kind === 'prod' ? ' and to ref_type tag' : ''}?`;
+
+          // --- login
+          let jwt;
+          try {
+            jwt = await core.getIDToken(env.OPENBAO_AUDIENCE);
+          } catch (e) {
+            throw new Error(`Cannot get the job's GitHub OIDC token (${e.message}). The calling job needs 'permissions: id-token: write'.`);
+          }
+          let login;
+          try {
+            login = await call('POST', `auth/${env.OPENBAO_AUTH_PATH}/login`, { body: { role, jwt } });
+          } catch (e) {
+            throw new Error(`OpenBao at ${base} cannot be reached (${e.message}). ${CHECKS}`);
+          }
+          const token = login.json && login.json.auth && login.json.auth.client_token;
+          if (login.status !== 200 || !token) {
+            throw new Error(`OpenBao login as role '${role}' failed: ${why(login)}. ${CHECKS}`);
+          }
+          core.setSecret(token);
+
+          // --- reads. Every value is masked, line by line too (a PEM key spans
+          // lines and each line can be printed on its own), before export.
+          const exported = [];
+          const put = (name, value) => {
+            core.setSecret(value);
+            for (const line of value.split(/\r?\n/)) if (line.trim()) core.setSecret(line);
+            core.exportVariable(name, value);
+            exported.push(name);
+          };
+          const read = async (apiPath, label) => {
+            let r;
+            try {
+              r = await call('GET', apiPath, { token });
+            } catch (e) {
+              throw new Error(`Reading ${label} from OpenBao failed (${e.message}). ${CHECKS}`);
+            }
+            if (r.status === 404) throw new Error(`${label} does not exist in OpenBao. An operator stores it (csc-ocs-ansible scripts/ci-secrets, or bao kv put); a pipeline never writes it.`);
+            if (r.status === 403) throw new Error(`Role '${role}' may not read ${label} (${why(r)}). Its policies are in csc-ocs-ansible stacks/platform/openbao/openbao-config.yml.`);
+            if (r.status !== 200 || !r.json || !r.json.data || !r.json.data.data) throw new Error(`Reading ${label} failed: ${why(r)}. ${CHECKS}`);
+            return r.json.data.data;
+          };
+
+          for (const tool of tools) {
+            const label = `devsecops/ci/${kind}/${tool}`;
+            const fields = await read(`devsecops/data/ci/${kind}/${tool}`, label);
+            const ignored = [];
+            for (const [field, value] of Object.entries(fields)) {
+              const name = MAP[tool][field];
+              if (!name) { ignored.push(field); continue; }
+              if (typeof value === 'number') { put(name, String(value)); continue; }
+              if (typeof value !== 'string' || value === '') { ignored.push(field); continue; }
+              put(name, value);
+            }
+            core.info(`${label}: exported ${exported.length ? exported.join(', ') : 'nothing'}${ignored.length ? `; ignored fields: ${ignored.join(', ')}` : ''}`);
+            exported.length = 0;
+          }
+          for (const name of words(env.OPENBAO_REPO)) {
+            const label = `ocs/ci/${env.REPO_NAME}/${name}`;
+            const data = await read(`ocs/data/ci/${env.REPO_NAME}/${name}`, label);
+            if (typeof data.value !== 'string') throw new Error(`${label} has no string key 'value'.`);
+            put(name, data.value);
+          }
+          core.info(`devsecops layout: ${kind} build, role ${role}, tools ${tools.join(' ')}`);
