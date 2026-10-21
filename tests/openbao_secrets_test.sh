@@ -180,6 +180,24 @@ EOF"
     "sonar https://sonar.example '' 'devsecops/ci/dev/sonarqube (field url)' 'devsecops/ci/dev/sonarqube (field token)' | grep -q 'SONAR_TOKEN is empty: OpenBao has no value at devsecops/ci/dev/sonarqube (field token)'"
   check "python-ci preflight: github mode keeps its message" \
     "sonar '' tok '' '' | grep -qx '::error::SONAR_HOST_URL is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list. With secrets-source: openbao it comes from OpenBao (docs/openbao-secrets.md).'"
+
+  # The action's "Stop if OpenBao could not be read", as GitHub runs a bash
+  # step, with its ${{ }} expressions filled in.
+  python3 - "$ACT" >"$tmp/stop.sh" <<'EOF'
+import re, sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"]
+run = [s for s in steps if s.get("name") == "Stop if OpenBao could not be read"][0]["run"]
+print(re.sub(r"\$\{\{.*?\}\}", "EXPR", run), end="")
+EOF
+  stop_run() { env -i PATH="$PATH" SHARED="$1" REPO="$2" REPO_NAME=repo-x bash --noprofile --norc -eo pipefail "$tmp/stop.sh"; }
+  stop_out() { stop_run "$@" 2>&1 || true; }
+  stop_cmds() {  # the bao commands only
+    stop_out 'NEXUS_HOST SONAR_HOST_URL' 'EXTRA' | grep 'bao kv metadata get'
+  }
+  check "ocs Stop step: stops the job" "! stop_run NEXUS_HOST '' >/dev/null 2>&1"
+  check "ocs Stop step: one bao command per path, with that path (shared and repo)" \
+    "[ \"\$(stop_cmds)\" = \"\$(printf '  bao kv metadata get -mount=ocs %s\\n' ci/shared/NEXUS_HOST ci/shared/SONAR_HOST_URL ci/repo-x/EXTRA)\" ]"
+  check "ocs Stop step: no bao command for a read with no names" "! stop_out '' '' | grep -q 'bao kv'"
 else
   echo "SKIP - python3 with PyYAML not found (step behaviour)"
 fi

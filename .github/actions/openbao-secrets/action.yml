@@ -133,7 +133,9 @@ runs:
         for n in $SHARED; do paths="$paths ocs/ci/shared/$n"; done
         for n in $REPO; do paths="$paths ocs/ci/$REPO_NAME/$n"; done
         if [ -n "$paths" ]; then
-          echo "::error::This read needs each of these, with the key 'value':$paths. Any one missing fails it. 'bao kv metadata get -mount=ocs ci/shared/<NAME>' shows whether one exists, without its value."
+          echo "::error::This read needs each of these, with the key 'value':$paths. Any one missing fails it. The job log lists, per path, the command that shows whether it exists, without its value."
+          # Mount ocs, then the path inside it: ci/shared/<NAME> or ci/<repo>/<NAME>.
+          for p in $paths; do echo "  bao kv metadata get -mount=ocs ${p#ocs/}"; done
         fi
         exit 1
 
