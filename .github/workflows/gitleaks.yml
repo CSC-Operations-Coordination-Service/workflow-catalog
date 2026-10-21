@@ -39,6 +39,11 @@ on:
   push:
   pull_request:
 
+# Read-only token for the runs this repository triggers (push, pull_request);
+# the job keeps its own block. A caller's grant can only be narrowed by this.
+permissions:
+  contents: read
+
 jobs:
   gitleaks:
     runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}

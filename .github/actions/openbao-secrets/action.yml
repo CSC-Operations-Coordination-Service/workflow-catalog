@@ -42,7 +42,7 @@ description: >
 
 inputs:
   openbao-url:
-    description: "OpenBao API URL, e.g. https://openbao:8200"
+    description: "OpenBao API URL, https:// only (anything else stops the job before the login), e.g. https://openbao:8200"
     required: true
   role:
     description: >
@@ -86,6 +86,26 @@ inputs:
 runs:
   using: composite
   steps:
+    # Both layouts, before anything else. The login sends the job's OIDC token
+    # and the reply carries the secrets: vault-action (ocs layout) would do both
+    # over whatever scheme the URL names, in clear on http://. Node's https
+    # (devsecops layout) would refuse http:// too, but only after the token is
+    # requested, and with a bare "Protocol not supported". No whitespace or
+    # control character either: no URL holds one, and the later messages print
+    # the URL, where a newline could start a workflow command. Under sh: the
+    # job may run in an Alpine container, without bash.
+    - name: Check openbao-url
+      shell: sh
+      env:
+        OPENBAO_URL: ${{ inputs.openbao-url }}
+      run: |
+        case $OPENBAO_URL in
+          *[[:space:][:cntrl:]]*) ;;
+          https://?*) exit 0 ;;
+        esac
+        printf "::error::openbao-url must be an https:// URL, on one line, without spaces (got '%s'): the login sends the job's OIDC token and the reply carries the secrets, so neither may cross the network in clear.\n" "$(printf '%s' "$OPENBAO_URL" | tr '\t\n\r' '   ')"
+        exit 1
+
     # --- ocs layout: ocs/ci/shared/<NAME>, ocs/ci/<repo>/<NAME> ----------------
     - name: Build the secret mapping
       id: map
@@ -133,9 +153,14 @@ runs:
         SHARED: ${{ inputs.shared }}
         REPO: ${{ inputs.repo }}
         REPO_NAME: ${{ github.event.repository.name }}
+        # Through the environment, not ${{ }} in the script: a value pasted
+        # into the script would be run as code.
+        OPENBAO_URL: ${{ inputs.openbao-url }}
+        OPENBAO_ROLE: ${{ inputs.role }}
+        REPOSITORY: ${{ github.repository }}
       run: |
-        echo "::error::OpenBao login or secret read failed at ${{ inputs.openbao-url }} (role ${{ inputs.role }})."
-        echo "::error::Check, in order: is OpenBao SEALED? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to ${{ github.repository }}? Do the secret names exist under ocs/ci?"
+        echo "::error::OpenBao login or secret read failed at $OPENBAO_URL (role $OPENBAO_ROLE)."
+        echo "::error::Check, in order: is OpenBao SEALED? Does this job have 'permissions: id-token: write'? Does the job's container join the ocs_openbao network? Does the role exist and is it bound to $REPOSITORY? Do the secret names exist under ocs/ci?"
         # The paths, never the values: one path that no operator has stored
         # yet (for python-ci, ocs/ci/shared/SONAR_HOST_URL, say) fails the
         # whole read, and the list says where to look without opening the
@@ -231,7 +256,7 @@ runs:
             dockerhub: ['username', 'token'],
             cosign: ['private_key', 'password'],
           };
-          // A number is fine (an operator may store port=8082 as JSON); blank,
+          // A number is fine (an operator may store port=5000 as JSON); blank,
           // a boolean, an object or null is not a value a workflow can use.
           const usable = (v) => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '');
           // How an operator fixes a missing secret or field: the script's
@@ -239,7 +264,7 @@ runs:
           // hand, values go in on stdin (`field=-`, typed or piped, one per
           // command) or from a file (`field=@path`), never as an argument,
           // where the shell history and the process list would keep them.
-          const HOWTO = (tool) => `An operator stores it with the platform repository's CI secrets script (devsecops layout, component ${tool}, dry run first), or by hand: bao kv put -mount=devsecops ci/${kind}/${tool} <field>=... (bao kv patch to add a field), each secret field as <field>=- (stdin) or <field>=@<file>, never as an argument. A pipeline never writes it.`;
+          const HOWTO = (tool) => `An operator stores it with the platform repository's CI-secrets tool (devsecops layout, component ${tool}, dry run first), or by hand: bao kv put -mount=devsecops ci/${kind}/${tool} <field>=... (bao kv patch to add a field), each secret field as <field>=- (stdin) or <field>=@<file>, never as an argument. A pipeline never writes it.`;
 
           // --- refuse a bad request before talking to OpenBao. Object.hasOwn,
           // not `in`: 'constructor' is `in` every object.
@@ -274,7 +299,7 @@ runs:
           }
 
           // --- HTTPS to OpenBao. Node's https ignores HTTPS_PROXY, which is what
-          // we want: openbao:8200 is on the overlay, never behind squid.
+          // we want: openbao:8200 is on the overlay, never behind the egress proxy.
           const base = env.OPENBAO_URL.replace(/\/+$/, '');
           const ca = fs.readFileSync(path.join(env.ACTION_PATH, 'openbao-ca.crt'), 'utf8');
           const call = (method, apiPath, { token, body } = {}) => new Promise((resolve, reject) => {
@@ -362,7 +387,7 @@ runs:
           }
           for (const name of words(env.OPENBAO_REPO)) {
             const label = `ocs/ci/${env.REPO_NAME}/${name}`;
-            const STORE = "An operator stores it by hand: bao kv put -mount=ocs ci/<repo>/<name> value=- (stdin) or value=@<file>, never as an argument (the platform repository's CI secrets script writes no ocs/ci/<repo> secret). A pipeline never writes it.";
+            const STORE = "An operator stores it by hand: bao kv put -mount=ocs ci/<repo>/<name> value=- (stdin) or value=@<file>, never as an argument (the platform repository's CI-secrets tool writes no ocs/ci/<repo> secret). A pipeline never writes it.";
             const data = await read(`ocs/data/ci/${env.REPO_NAME}/${name}`, label, STORE);
             // The rule of a required field: a blank value would only resurface
             // later as an empty variable, far from its cause.

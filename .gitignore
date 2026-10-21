@@ -1,1 +1,16 @@
 venv/
+
+# Never committed: local credentials and keys.
+.env
+*.pem
+*.key
+cosign.key
+.netrc
+.npmrc
+
+# Local test and tool output.
+.tox/
+.coverage
+
+# Per-user Claude Code settings.
+.claude/settings.local.json

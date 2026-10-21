@@ -33,14 +33,42 @@ check "action logs in as <role>-sign when tools is cosign alone" "grep -q \"cons
 # The catalog is public: its messages point at the platform repository's OpenBao
 # configuration, never at its files or its operations.
 check "action messages ask whether OpenBao is sealed, and point at the platform's configuration, without detail" "[ \"\$(grep -c 'Check, in order: is OpenBao SEALED? Does this job' '$ACT')\" = 2 ] && grep -q \"Its policies are in the platform repository's OpenBao configuration.\\\`);\" '$ACT'"
-# The platform repository's CI secrets script writes devsecops/ci/<kind>/<tool>
+# The platform repository's CI-secrets tool writes devsecops/ci/<kind>/<tool>
 # (its devsecops layout): the operator's message names it, by what it is, not
 # by its path, and nothing still says it does not write this layout.
-check "the devsecops message names the platform's CI secrets script as the writer" "grep 'const HOWTO' '$ACT' | grep -q \"the platform repository's CI secrets script (devsecops layout, component \\\${tool}\" && ! grep -q 'does not write this layout' '$ACT'"
-# Nor does any text of the action name the private platform repository or its
-# paths, and no catalog text names a real CI role (the public form is ci-<repo>).
-check "the action names no path of the private platform repository" "! grep -Eq 'csc-ocs-ansible|scripts/ci-secrets|ci_secrets\\.py' '$ACT'"
-check "no workflow, action or doc names a real CI role" "! grep -rEq 'ci-ocs-' '$ROOT/.github' '$ROOT/docs' '$ROOT/README.md'"
+check "the devsecops message names the platform's CI-secrets tool as the writer" "grep 'const HOWTO' '$ACT' | grep -q \"the platform repository's CI-secrets tool (devsecops layout, component \\\${tool}\" && ! grep -q 'does not write this layout' '$ACT'"
+# Nor does any catalog text name the private platform repository, its files or
+# a real host, and no workflow, action or doc names a real CI role (the public
+# form is ci-<repo>). The patterns match shapes, not whole names, so that this
+# file does not spell what it keeps out. PRIVATE: one alternative per kind of
+# private name (the platform repository, its CI-secrets tool, its file tree, its
+# hosts); the prose "CI-secrets tool" is upper case and passes. ROLE: a role with
+# more than one word after ci- (ci-<repo> has one), in .github, docs and README
+# only, because the tests use made-up roles such as ci-x-release. Every file git
+# knows, tracked or new, is searched, this one excepted. A failure prints
+# file:line only, never the text that matched.
+PRIVATE='[[:alnum:]]-ansible|ci[-_]secrets|stacks/[a-z]+/|[a-z]+-[a-z]+-[a-z]+-[0-9][0-9]([^0-9]|$)'
+ROLE='(^|[^[:alnum:]-])ci-[a-z0-9]+-[a-z0-9]'
+catalog_grep() {  # catalog_grep <ERE> <path>...: file:line of each match
+  local re="$1"; shift
+  if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$ROOT" grep --untracked -nIE -e "$re" -- "$@" ':!tests/openbao_secrets_test.sh'
+  else  # not a git checkout: the catalog's own directories
+    [ "$*" = . ] && set -- .github docs scripts tests README.md
+    (cd "$ROOT" && grep -rnIE --exclude=openbao_secrets_test.sh -e "$re" -- "$@")
+  fi | cut -d: -f1,2
+}
+none_of() { local hits; hits="$(catalog_grep "$@")"; [ -z "$hits" ] || { printf '  %s\n' $hits; false; }; }
+check "no catalog text names the private platform repository, its files or a real host" "none_of '$PRIVATE' ."
+check "no workflow, action or doc names a real CI role" "none_of '$ROLE' .github docs README.md"
+# The patterns themselves: each catches what it is for. The samples are made
+# up, say no more than the patterns do, and are built from parts, so that no
+# sample appears whole in this file.
+guard_catches() { printf '%s\n' "$2" | grep -Eq "$1"; }
+check "  ...the patterns catch what they are for" \
+  "guard_catches '$PRIVATE' 'see x''x-ansible' && guard_catches '$PRIVATE' 'ci''-secrets' && guard_catches '$PRIVATE' 'ci''_secrets' && guard_catches '$PRIVATE' 'stacks''/abc/x' && guard_catches '$PRIVATE' 'aaa-bbbb-cccc''-02.example' && guard_catches '$ROLE' 'role ci-abc''-def-ghi'"
+check "  ...and leave the public forms alone" \
+  "! guard_catches '$PRIVATE' \"the platform repository's CI-secrets tool, ci-<repo>, dev.ocs-registry.local\" && ! guard_catches '$ROLE' 'ci-<repo>-sign, <openbao-role>-release, tok-ci-x-sign'"
 
 # --- the workflows
 # Reads of a managed value that are NOT in the guarded form
@@ -341,6 +369,79 @@ check "node-workflow.yml and python-ci.yml read no Cosign value from OpenBao" "!
 check "docker-build.yml: runs-on is an input, default self-hosted" "grep -A4 '^      runs-on:' '$DOCKER' | grep -q 'default: self-hosted' && ! grep -q '^    runs-on: self-hosted' '$DOCKER'"
 check "node-workflow.yml: no job hardcodes self-hosted" "! grep -q '^    runs-on: self-hosted' '$NODE'"
 check "node-workflow.yml: container job joins the openbao network only in openbao mode" "grep -q -- '--network ocs_openbao' '$NODE' && grep -B2 -- '--network ocs_openbao' '$NODE' | grep -q 'secrets-source'"
+
+# --- protections that a later edit could undo without any other test noticing:
+# the https:// check on openbao-url, no ${{ }} in a script, and the masking of
+# the normalised registry. The steps are read from the files and run, not copied.
+if python3 -c 'import yaml' 2>/dev/null; then
+  # step_run <workflow or action> <step name>: that step's run: body.
+  step_run() { python3 - "$1" "$2" <<'EOF'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+if "runs" in d:
+    steps = d["runs"].get("steps") or []
+else:
+    steps = [s for j in d["jobs"].values() for s in j.get("steps") or []]
+print("".join(s["run"] for s in steps if s.get("name") == sys.argv[2] and "run" in s), end="")
+EOF
+  }
+  # The action's first step, under sh as GitHub runs it (dash here, ash in an
+  # Alpine job container). Both layouts send the token, so it has no if:.
+  first_step() { python3 -c 'import sys, yaml; s = yaml.safe_load(open(sys.argv[1]))["runs"]["steps"][0]; print(s.get("name"), s.get("shell"), "if" in s)' "$ACT"; }
+  step_run "$ACT" 'Check openbao-url' >"$tmp/url.sh"
+  url_run() { env -i PATH="$PATH" OPENBAO_URL="$1" sh "$tmp/url.sh"; }
+  url_refused() {  # every sample is refused; prints the first one that is not
+    local u
+    for u in 'http://bao.example.internal:8200' '' 'https://' 'HTTPS://bao.example.internal' \
+             'bao.example.internal:8200' 'https://bao.example.internal x' \
+             "$(printf 'https://bao.example.internal\n::warning::x')" "$(printf 'https://bao.example.internal\tx')"; do
+      if url_run "$u" >/dev/null 2>&1; then printf '  accepted: %q\n' "$u"; return 1; fi
+    done
+  }
+  check "action: 'Check openbao-url' is the first step, under sh, with no if:" "[ \"\$(first_step)\" = 'Check openbao-url sh False' ]"
+  check "action: an https:// openbao-url passes" "url_run https://bao.example.internal:8200"
+  check "action: http://, no scheme, an empty host, whitespace or a newline is refused" url_refused
+  check "action: the refusal is an ::error:: that asks for https://" \
+    "{ url_run http://bao.example.internal:8200 2>&1; true; } | grep -q '^::error::openbao-url must be an https:// URL'"
+
+  # A ${{ }} inside a script is pasted into it before the shell starts: an input
+  # or a secret holding a quote or $(...) would run as code. Every value goes
+  # through env:. The one exception is by design: node-workflow's four command
+  # steps run the caller's own command, their whole run: is ${{ inputs.<x>-command }}.
+  exprs_in_runs() { python3 - "$ROOT" <<'EOF'
+import glob, os, re, sys, yaml
+root = sys.argv[1]
+caller = re.compile(r"\$\{\{ inputs\.[a-z]+-command \}\}")
+files = glob.glob(root + "/.github/workflows/*.y*ml") + glob.glob(root + "/.github/actions/*/action.y*ml")
+for f in sorted(files):
+    d = yaml.safe_load(open(f))
+    if "runs" in d:
+        steps = d["runs"].get("steps") or []
+    else:
+        steps = [s for j in (d.get("jobs") or {}).values() for s in j.get("steps") or []]
+    rel = os.path.relpath(f, root)
+    for s in steps:
+        run = s.get("run")
+        if run is None or "${{" not in str(run):
+            continue
+        if rel == ".github/workflows/node-workflow.yml" and caller.fullmatch(str(run).strip()):
+            print("caller", rel, s.get("name"))
+        else:
+            print("script", rel, s.get("name"))
+EOF
+  }
+  check "no run: body holds a \${{ }} expression, except node-workflow's four caller commands" \
+    "exprs_in_runs >'$tmp/exprs' && ! grep '^script' '$tmp/exprs' && [ \"\$(grep -c '^caller' '$tmp/exprs')\" = 4 ]"
+
+  # docker-build.yml's registry step, as GitHub runs it (bash): GitHub masks the
+  # secret as stored, so the normalised value and its host are masked here.
+  step_run "$DOCKER" 'Resolve Nexus registry for context' >"$tmp/reg.sh"
+  reg_run() { : >"$tmp/genv"; env -i PATH="$PATH" GITHUB_ENV="$tmp/genv" ENVIRONMENT=dev RAW_DEV="$1" RAW_PROD= bash --noprofile --norc "$tmp/reg.sh" 2>&1; }
+  check "docker-build.yml: the normalised registry and its host are masked, and exported" \
+    "reg_run ' https://nexus.example.internal:5000/' >'$tmp/reg.out' && grep -qx '::add-mask::nexus.example.internal:5000' '$tmp/reg.out' && grep -qx '::add-mask::nexus.example.internal' '$tmp/reg.out' && grep -qx 'NEXUS_DOCKER_REGISTRY=nexus.example.internal:5000' '$tmp/genv'"
+else
+  echo "SKIP - python3 with PyYAML not found (openbao-url, run: bodies, masking)"
+fi
 
 # --- one ref for everything this branch adds. A workflow that calls another catalog
 # workflow or the action at a different ref (e.g. @develop while the new inputs only
