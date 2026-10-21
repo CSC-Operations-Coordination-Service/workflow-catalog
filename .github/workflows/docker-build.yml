@@ -238,6 +238,18 @@ on:
         required: false
         type: string
         default: ""
+      openbao-tools:
+        description: >
+          Tools whose values come from the devsecops layout
+          (devsecops/ci/<dev|prod>/<tool>) instead of ocs/ci/shared, separated by
+          spaces on one line, e.g. "nexus dependency-track". A tool not listed
+          keeps the ocs layout. Tag builds read prod and log in as
+          <openbao-role>-release; `environment` must then be prod, and dev on any
+          other build (the read stops the job otherwise). Only with
+          secrets-source: openbao.
+        required: false
+        type: string
+        default: ""
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -296,49 +308,50 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # Each read sets exactly one of tools / shared: the devsecops layout when the
+      # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
+      # In the devsecops layout a non-tag build gets only NEXUS_DOCKER_REGISTRY_DEV
+      # and a tag build only _PROD; `environment` makes the action stop a build
+      # whose environment disagrees, before "Resolve Nexus registry" would.
       - name: Read secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
-          shared: |
-            NEXUS_HOST
-            NEXUS_PORT
-            NEXUS_USERNAME
-            NEXUS_PASSWORD
-            NEXUS_DOCKER_REGISTRY_DEV
-            NEXUS_DOCKER_REGISTRY_PROD
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' nexus ') && 'nexus' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' nexus ') && 'NEXUS_HOST NEXUS_PORT NEXUS_USERNAME NEXUS_PASSWORD NEXUS_DOCKER_REGISTRY_DEV NEXUS_DOCKER_REGISTRY_PROD' || '' }}
+          environment: ${{ inputs.environment }}
 
       - name: Read Docker Hub secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.push-to-dockerhub
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
-          shared: |
-            DOCKERHUB_USERNAME
-            DOCKERHUB_TOKEN
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' dockerhub ') && 'dockerhub' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' dockerhub ') && 'DOCKERHUB_USERNAME DOCKERHUB_TOKEN' || '' }}
+          environment: ${{ inputs.environment }}
 
       - name: Read Dependency-Track secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.generate-sbom
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
-          shared: |
-            DEPENDENCYTRACK_URL
-            DEPENDENCYTRACK_API_KEY
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'dependency-track' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'DEPENDENCYTRACK_URL DEPENDENCYTRACK_API_KEY' || '' }}
+          environment: ${{ inputs.environment }}
 
       - name: Read Cosign secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.sign-image
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
-          shared: |
-            COSIGN_PRIVATE_KEY
-            COSIGN_PASSWORD
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' cosign ') && 'cosign' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' cosign ') && 'COSIGN_PRIVATE_KEY COSIGN_PASSWORD' || '' }}
+          environment: ${{ inputs.environment }}
 
       - name: Download artifact
         if: inputs.artifact-name != ''

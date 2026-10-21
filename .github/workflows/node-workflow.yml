@@ -173,6 +173,16 @@ on:
         required: false
         type: string
         default: ""
+      openbao-tools:
+        description: >
+          Tools whose values come from the devsecops layout
+          (devsecops/ci/<dev|prod>/<tool>) instead of ocs/ci/shared, separated by
+          spaces on one line, e.g. "nexus dependency-track". A tool not listed
+          keeps the ocs layout. Tag builds read prod and log in as
+          <openbao-role>-release. Only with secrets-source: openbao.
+        required: false
+        type: string
+        default: ""
 
 jobs:
   node-ci:
@@ -201,17 +211,16 @@ jobs:
           restore-keys: |
             npm-${{ inputs.working-directory }}-
 
+      # Exactly one of tools / shared is set: the devsecops layout when the
+      # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
       - name: Read secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.use-nexus-registry
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
-          shared: |
-            NEXUS_HOST
-            NEXUS_PORT
-            NEXUS_USERNAME
-            NEXUS_PASSWORD
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' nexus ') && 'nexus' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' nexus ') && 'NEXUS_HOST NEXUS_PORT NEXUS_USERNAME NEXUS_PASSWORD' || '' }}
 
       # Writes ~/.npmrc and exports NPM_CONFIG_USERCONFIG, so every npm step
       # below resolves through Nexus. Before the install, and after the cache
@@ -320,13 +329,12 @@ jobs:
 
       - name: Read secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
-          shared: |
-            DEPENDENCYTRACK_URL
-            DEPENDENCYTRACK_API_KEY
+          tools: ${{ contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'dependency-track' || '' }}
+          shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'DEPENDENCYTRACK_URL DEPENDENCYTRACK_API_KEY' || '' }}
 
       - name: Upload SBOM to Dependency-Track
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/dependency-track-upload@develop
@@ -349,8 +357,9 @@ jobs:
     # run at startup -- for every caller, openbao or not. Callers already grant
     # contents: read and packages: write for this job.
     # TEMPORARY, with the openbao-secrets action refs: the new inputs only exist on
-    # this branch. All of them go back to @develop when the branch is merged.
-    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/openbao-secrets
+    # this branch (ci/devsecops-secrets). All of them go back to @develop when the
+    # branch is merged.
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/docker-build.yml@ci/devsecops-secrets
     with:
       image-name: ${{ inputs.image-name }}
       context: ${{ inputs.docker-context }}
@@ -372,4 +381,5 @@ jobs:
       secrets-source: ${{ inputs.secrets-source }}
       openbao-url: ${{ inputs.openbao-url }}
       openbao-role: ${{ inputs.openbao-role }}
+      openbao-tools: ${{ inputs.openbao-tools }}
     secrets: inherit
