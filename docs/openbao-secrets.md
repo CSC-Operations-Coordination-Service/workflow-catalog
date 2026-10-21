@@ -11,17 +11,27 @@ behaviour is unchanged: without the inputs below every value still comes from
 
 With `secrets-source: openbao`, OpenBao is the only source. A value it does not
 give is empty: the workflows never fall back to `secrets.*`, even with
-`secrets: inherit`. A gap in OpenBao stops the job where it is, instead of being
-filled quietly from a GitHub secret.
+`secrets: inherit`. What the OpenBao read itself stops the job on:
+
+| Gap in OpenBao | ocs layout (vault-action) | devsecops layout (`openbao-tools`) |
+| --- | --- | --- |
+| Failed login, or a path that does not exist or that the role may not read | stops the job | stops the job |
+| A secret without its key `value`, or a tool's secret without a required field | stops the job | stops the job |
+| That key or field stored empty or blank | **not caught**: exported as an empty or blank variable | stops the job, also for a `repo` name's `value` |
+
+In the ocs layout an empty value goes on until a step needs it.
+`python-ci.yml`'s SonarQube preflight stops on an empty URL or token and names
+the OpenBao path. Anywhere else it surfaces later, as a failed login or an empty
+URL.
 
 ## What the caller sets
 
 | Input | Default | Purpose |
 | --- | --- | --- |
-| `secrets-source` | `github` | `openbao` reads the values from OpenBao |
+| `secrets-source` | `github` | `openbao` reads the values from OpenBao. Any other value (`open-bao`, `OpenBao`, empty) stops the job at the step "Check secrets-source and openbao-tools", before any read |
 | `openbao-url` | `https://openbao:8200` | Reachable from the runner pool only (overlay `ocs_openbao`) |
 | `openbao-role` | — | The repository's JWT role, e.g. `ci-ocs-operator-app` |
-| `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), separated by single spaces on one line (`nexus sonarqube`). An unknown name, a comma, a tab or a newline stops the job at the step "Check openbao-tools". Empty: every value from `ocs/ci/shared`, as before |
+| `openbao-tools` | — | Tools read from the [devsecops layout](#the-devsecops-layout-openbao-tools), separated by single spaces on one line (`nexus sonarqube`). An unknown name, a comma, a tab or a newline stops the job at the step "Check secrets-source and openbao-tools". Empty: every value from `ocs/ci/shared`, as before |
 | `runs-on` | `self-hosted` | Use `containerized` (a single label; the input is a string, not a list) |
 
 Two things the **caller job** must do, because a reusable workflow cannot grant
@@ -69,8 +79,10 @@ a pipeline. Roles and policies are in csc-ocs-ansible
 (`stacks/platform/openbao/openbao-config.yml`).
 
 The names each workflow reads from `ocs/ci/shared`, for a tool not listed in
-`openbao-tools`. Every name read must exist: one missing path stops the read,
-and the job's error lists the paths it needed.
+`openbao-tools`. Every name read must exist: one missing path stops the read.
+The job's error lists the paths it needed, and the log gives, per path, the
+`bao kv metadata get -mount=ocs ...` command that shows whether it exists,
+without its value.
 
 | Workflow | When | Names under `ocs/ci/shared` |
 | --- | --- | --- |
@@ -171,7 +183,8 @@ jobs:
    `docker-environment: prod` stops at the read; a tool whose secret does not
    exist stops the job naming its path; a secret without one of its required
    fields stops the job naming the path and the field; a misspelled tool in
-   `openbao-tools` stops the job at "Check openbao-tools".
+   `openbao-tools`, or a misspelled `secrets-source`, stops the job at
+   "Check secrets-source and openbao-tools".
 
 Before the branch is merged, every `@ci/devsecops-secrets` ref inside the
 catalog goes back to `@develop`, and the pilots move to `@develop` with it.

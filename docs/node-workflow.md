@@ -58,7 +58,7 @@ jobs:
 | `working-directory` (required) | — | Directory containing `package.json` |
 | `node-version` | `22` | Node major / `node:<v>` container tag |
 | `runs-on` | `self-hosted` | Runner label (a single label; `containerized` for the container runner pool) |
-| `secrets-source` | `github` | `openbao`: read the Nexus / Dependency-Track / Docker Hub / Cosign values from OpenBao instead of `secrets.*`, and only from there (no fallback to `secrets.*`). The caller job then needs `permissions: id-token: write`. See [openbao-secrets.md](openbao-secrets.md) |
+| `secrets-source` | `github` | `openbao`: read the Nexus / Dependency-Track / Docker Hub / Cosign values from OpenBao instead of `secrets.*`, and only from there (no fallback to `secrets.*`). The caller job then needs `permissions: id-token: write`. Any value other than `github` or `openbao` stops the job. See [openbao-secrets.md](openbao-secrets.md) |
 | `openbao-url` / `openbao-role` | `https://openbao:8200` / — | OpenBao address and this repository's JWT role (`secrets-source: openbao`) |
 | `openbao-tools` | — | Tools read from the devsecops layout instead of `ocs/ci/shared`, separated by single spaces on one line (`nexus dependency-track`); an unknown name or another separator stops the job. Forwarded to the image build. See [openbao-secrets.md](openbao-secrets.md#the-devsecops-layout-openbao-tools) |
 | `use-nexus-registry` | `false` | Install from the organization's Nexus npm registry instead of registry.npmjs.org. Also forwarded to the image build as `mount-npm-registry` |
