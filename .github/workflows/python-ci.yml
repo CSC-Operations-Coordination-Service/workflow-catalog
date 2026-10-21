@@ -11,8 +11,8 @@ name: Python CI (reusable)
 #   NEXUS_HOST, NEXUS_PORT           (rendered into ~/pip.conf and ~/.pypirc)
 #   NEXUS_USERNAME, NEXUS_PASSWORD   (pip reads via ~/.netrc + twine publish)
 #   SONAR_TOKEN, SONAR_HOST_URL      (SonarQube scan)
-# or, with secrets-source: openbao, the same values from OpenBao
-# (docs/openbao-secrets.md).
+# or, with secrets-source: openbao, the same values from OpenBao only, never
+# from these secrets (docs/openbao-secrets.md).
 #
 # Outputs:
 #   version — the setuptools_scm version resolved for this ref.
@@ -52,7 +52,9 @@ on:
           Where the Nexus and SonarQube values come from. `github` (default):
           the repository/organization secrets, as before. `openbao`: read them
           from OpenBao with the job's OIDC token (JWT auth), for private
-          repositories that cannot use organization secrets. `openbao` needs
+          repositories that cannot use organization secrets. Then OpenBao is the
+          only source: a value it does not give is empty, never taken from
+          secrets.* (even with `secrets: inherit`). `openbao` needs
           `permissions: id-token: write` on the calling job, and the
           containerized runner pool (runs-on: containerized).
         required: false
@@ -72,8 +74,9 @@ on:
         description: >
           Tools whose values come from the devsecops layout
           (devsecops/ci/<dev|prod>/<tool>) instead of ocs/ci/shared, separated by
-          spaces on one line, e.g. "nexus sonarqube". A tool not listed keeps the
-          ocs layout. Tag builds read prod and log in as <openbao-role>-release,
+          single spaces on one line, e.g. "nexus sonarqube"; an unknown name or
+          any other separator stops the job. A tool not listed keeps the ocs
+          layout. Tag builds read prod and log in as <openbao-role>-release,
           which matches the Nexus context this workflow already picks (prod on
           refs/tags/*). Only with secrets-source: openbao.
         required: false
@@ -99,6 +102,32 @@ jobs:
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # openbao-tools is matched below with contains(' <tool> '), which takes a
+      # misspelled tool, or a list split by newlines, tabs or commas, for no
+      # tool at all: the read would quietly keep the ocs layout, out of reach of
+      # the action's own check for unknown tools. Refuse such a list here.
+      - name: Check openbao-tools
+        if: inputs.secrets-source == 'openbao' && inputs.openbao-tools != ''
+        shell: bash
+        env:
+          OPENBAO_TOOLS: ${{ inputs.openbao-tools }}
+        run: |
+          set -euo pipefail
+          known="nexus sonarqube dependency-track dockerhub cosign"
+          # One line, one space between names: the only form the matchers see.
+          re='^[a-z-]+( [a-z-]+)*$'
+          if ! [[ $OPENBAO_TOOLS =~ $re ]]; then
+            echo "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got $(printf '%q' "$OPENBAO_TOOLS")). Known: $known."
+            exit 1
+          fi
+          for t in $OPENBAO_TOOLS; do
+            case " $known " in
+              *" $t "*) ;;
+              *) echo "::error::Unknown tool '$t' in openbao-tools. Known: $known."; exit 1 ;;
+            esac
+          done
+          echo "openbao-tools: $OPENBAO_TOOLS"
+
       # Exactly one of tools / shared is set: the devsecops layout when the
       # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
       - name: Read Nexus secrets from OpenBao
@@ -114,10 +143,10 @@ jobs:
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
-          nexus-host: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
-          nexus-port: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
-          nexus-username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          nexus-password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          nexus-host: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_HOST || '') }}
+          nexus-port: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PORT || '') }}
+          nexus-username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          nexus-password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
 
       - name: Install tox
         run: pip install tox
@@ -184,6 +213,11 @@ jobs:
       options: ${{ inputs.secrets-source == 'openbao' && '--add-host=host.docker.internal:host-gateway --network ocs_openbao' || '--add-host=host.docker.internal:host-gateway' }}
 
     steps:
+      # In the ocs layout this reads ocs/ci/shared/SONAR_TOKEN and
+      # ocs/ci/shared/SONAR_HOST_URL. csc-ocs-ansible's scripts/ci-secrets does
+      # not write SONAR_HOST_URL: an operator stores it by hand, or the caller
+      # lists sonarqube in openbao-tools (devsecops/ci/<dev|prod>/sonarqube).
+      # A missing path stops the job at this read, naming the paths.
       - name: Read SonarQube secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
@@ -199,13 +233,28 @@ jobs:
       # scanner bootstrap ("Failed to query server version").
       - name: Check SonarQube URL and token
         env:
-          SONAR_TOKEN: ${{ inputs.secrets-source == 'openbao' && env.SONAR_TOKEN || secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ inputs.secrets-source == 'openbao' && env.SONAR_HOST_URL || secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ inputs.secrets-source == 'openbao' && env.SONAR_TOKEN || (inputs.secrets-source != 'openbao' && secrets.SONAR_TOKEN || '') }}
+          SONAR_HOST_URL: ${{ inputs.secrets-source == 'openbao' && env.SONAR_HOST_URL || (inputs.secrets-source != 'openbao' && secrets.SONAR_HOST_URL || '') }}
+          # The OpenBao path each value comes from, for the messages below: in
+          # openbao mode an empty value is a gap at exactly that path (nothing
+          # falls back to secrets.*). Chosen like the read above, and the kind
+          # like the action: prod on a tag build. Empty in github mode.
+          SONAR_HOST_URL_AT: ${{ inputs.secrets-source == 'openbao' && (contains(format(' {0} ', inputs.openbao-tools), ' sonarqube ') && format('devsecops/ci/{0}/sonarqube (field url)', github.ref_type == 'tag' && 'prod' || 'dev') || 'ocs/ci/shared/SONAR_HOST_URL (key value)') || '' }}
+          SONAR_TOKEN_AT: ${{ inputs.secrets-source == 'openbao' && (contains(format(' {0} ', inputs.openbao-tools), ' sonarqube ') && format('devsecops/ci/{0}/sonarqube (field token)', github.ref_type == 'tag' && 'prod' || 'dev') || 'ocs/ci/shared/SONAR_TOKEN (key value)') || '' }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
+          # empty NAME OPENBAO_PATH: stop on an empty value, naming where it was
+          # due to come from.
+          empty() {
+            case "$2" in
+              '') fail "$1 is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list. With secrets-source: openbao it comes from OpenBao (docs/openbao-secrets.md)." ;;
+              ocs/*) fail "$1 is empty: OpenBao has no value at $2. An operator stores it there, or the caller lists sonarqube in openbao-tools to read devsecops/ci/<dev|prod>/sonarqube instead (docs/openbao-secrets.md). In openbao mode the repository's secrets are not read." ;;
+              *) fail "$1 is empty: OpenBao has no value at $2. An operator stores it there (docs/openbao-secrets.md). In openbao mode the repository's secrets are not read." ;;
+            esac
+          }
 
-          [ -n "$SONAR_HOST_URL" ] || fail "SONAR_HOST_URL is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list. With secrets-source: openbao it comes from OpenBao (docs/openbao-secrets.md)."
-          [ -n "$SONAR_TOKEN" ] || fail "SONAR_TOKEN is empty. Add it as a repository or organization secret; for an org secret, check that this repo is in its access list. With secrets-source: openbao it comes from OpenBao (docs/openbao-secrets.md)."
+          [ -n "$SONAR_HOST_URL" ] || empty SONAR_HOST_URL "$SONAR_HOST_URL_AT"
+          [ -n "$SONAR_TOKEN" ] || empty SONAR_TOKEN "$SONAR_TOKEN_AT"
 
           case "$SONAR_HOST_URL" in
             http://*|https://*) ;;
@@ -254,8 +303,8 @@ jobs:
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
         env:
-          SONAR_TOKEN: ${{ inputs.secrets-source == 'openbao' && env.SONAR_TOKEN || secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ inputs.secrets-source == 'openbao' && env.SONAR_HOST_URL || secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ inputs.secrets-source == 'openbao' && env.SONAR_TOKEN || (inputs.secrets-source != 'openbao' && secrets.SONAR_TOKEN || '') }}
+          SONAR_HOST_URL: ${{ inputs.secrets-source == 'openbao' && env.SONAR_HOST_URL || (inputs.secrets-source != 'openbao' && secrets.SONAR_HOST_URL || '') }}
 
       # See the identical step in `test`: this container runs as root, and the
       # root-owned workspace it would leave behind breaks the checkout of the next
@@ -302,10 +351,10 @@ jobs:
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/nexus-context@develop
         with:
           context: ${{ startsWith(github.ref, 'refs/tags/') && 'prod' || 'dev' }}
-          nexus-host: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
-          nexus-port: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
-          nexus-username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          nexus-password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          nexus-host: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_HOST || '') }}
+          nexus-port: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PORT || '') }}
+          nexus-username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          nexus-password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
 
       - name: Install tox
         run: pip install tox setuptools_scm
@@ -379,8 +428,8 @@ jobs:
         run: tox -e publish
         working-directory: ${{ inputs.project-dir }}
         env:
-          TWINE_USERNAME: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          TWINE_PASSWORD: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          TWINE_USERNAME: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          TWINE_PASSWORD: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
 
       # See the identical step in `test` above: the root-owned workspace this
       # container leaves behind would break the checkout of the next

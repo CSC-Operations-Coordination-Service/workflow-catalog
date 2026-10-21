@@ -9,6 +9,8 @@ name: Docker build (reusable)
 #   NEXUS_HOST, NEXUS_PORT (only when mount-pip-index / mount-npm-registry: true),
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN,
 #   COSIGN_PRIVATE_KEY, COSIGN_PASSWORD (only when sign-image: true, release builds)
+# or, with secrets-source: openbao, the same values from OpenBao only, never
+# from these secrets (docs/openbao-secrets.md).
 
 on:
   workflow_call:
@@ -223,8 +225,10 @@ on:
           from. `github` (default): the repository/organization secrets, as
           before. `openbao`: read them from OpenBao with the job's OIDC token
           (JWT auth), for private repositories that cannot use organization
-          secrets. `openbao` needs `permissions: id-token: write` on the calling
-          job, and the containerized runner pool (runs-on: containerized).
+          secrets. Then OpenBao is the only source: a value it does not give is
+          empty, never taken from secrets.* (even with `secrets: inherit`).
+          `openbao` needs `permissions: id-token: write` on the calling job, and
+          the containerized runner pool (runs-on: containerized).
         required: false
         type: string
         default: github
@@ -242,11 +246,12 @@ on:
         description: >
           Tools whose values come from the devsecops layout
           (devsecops/ci/<dev|prod>/<tool>) instead of ocs/ci/shared, separated by
-          spaces on one line, e.g. "nexus dependency-track". A tool not listed
-          keeps the ocs layout. Tag builds read prod and log in as
-          <openbao-role>-release; `environment` must then be prod, and dev on any
-          other build (the read stops the job otherwise). Only with
-          secrets-source: openbao.
+          single spaces on one line, e.g. "nexus dependency-track"; an unknown
+          name or any other separator stops the job. A tool not listed keeps the
+          ocs layout. Tag builds read prod and log in as <openbao-role>-release;
+          `environment` must then be prod, and dev on any other build (the read
+          stops the job otherwise). Cosign is read on release builds with
+          sign-image only. Only with secrets-source: openbao.
         required: false
         type: string
         default: ""
@@ -308,6 +313,32 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # openbao-tools is matched below with contains(' <tool> '), which takes a
+      # misspelled tool, or a list split by newlines, tabs or commas, for no
+      # tool at all: the read would quietly keep the ocs layout, out of reach of
+      # the action's own check for unknown tools. Refuse such a list here.
+      - name: Check openbao-tools
+        if: inputs.secrets-source == 'openbao' && inputs.openbao-tools != ''
+        shell: bash
+        env:
+          OPENBAO_TOOLS: ${{ inputs.openbao-tools }}
+        run: |
+          set -euo pipefail
+          known="nexus sonarqube dependency-track dockerhub cosign"
+          # One line, one space between names: the only form the matchers see.
+          re='^[a-z-]+( [a-z-]+)*$'
+          if ! [[ $OPENBAO_TOOLS =~ $re ]]; then
+            echo "::error::openbao-tools must be tool names separated by single spaces on one line, e.g. \"nexus sonarqube\" (got $(printf '%q' "$OPENBAO_TOOLS")). Known: $known."
+            exit 1
+          fi
+          for t in $OPENBAO_TOOLS; do
+            case " $known " in
+              *" $t "*) ;;
+              *) echo "::error::Unknown tool '$t' in openbao-tools. Known: $known."; exit 1 ;;
+            esac
+          done
+          echo "openbao-tools: $OPENBAO_TOOLS"
+
       # Each read sets exactly one of tools / shared: the devsecops layout when the
       # caller lists the tool in openbao-tools, the ocs/ci/shared names otherwise.
       # In the devsecops layout a non-tag build gets only NEXUS_DOCKER_REGISTRY_DEV
@@ -343,8 +374,11 @@ jobs:
           shared: ${{ !contains(format(' {0} ', inputs.openbao-tools), ' dependency-track ') && 'DEPENDENCYTRACK_URL DEPENDENCYTRACK_API_KEY' || '' }}
           environment: ${{ inputs.environment }}
 
+      # Gated exactly like "Sign image (Cosign)", its only consumer: a branch
+      # build never signs, so it must not read the signing key either (in the
+      # devsecops layout it would need one in devsecops/ci/dev, or fail).
       - name: Read Cosign secrets from OpenBao
-        if: inputs.secrets-source == 'openbao' && inputs.sign-image
+        if: inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release
         uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/devsecops-secrets
         with:
           openbao-url: ${{ inputs.openbao-url }}
@@ -372,8 +406,8 @@ jobs:
         # usual copy-paste damage and fail here, naming the offending secret,
         # instead of several steps later on an unreadable error.
         env:
-          RAW_DEV: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_DEV || secrets.NEXUS_DOCKER_REGISTRY_DEV }}
-          RAW_PROD: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_PROD || secrets.NEXUS_DOCKER_REGISTRY_PROD }}
+          RAW_DEV: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_DEV || (inputs.secrets-source != 'openbao' && secrets.NEXUS_DOCKER_REGISTRY_DEV || '') }}
+          RAW_PROD: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_DOCKER_REGISTRY_PROD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_DOCKER_REGISTRY_PROD || '') }}
           ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
@@ -590,8 +624,8 @@ jobs:
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ env.NEXUS_DOCKER_REGISTRY }}
-          username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
 
       # BuildKit reads registry credentials from the client's docker config, so a
       # mirror on a different connector than the push target needs its own login —
@@ -602,8 +636,8 @@ jobs:
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ${{ steps.buildkit.outputs.mirror }}
-          username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          username: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
 
       - name: Log in to GitHub Container Registry
         if: inputs.push-to-ghcr
@@ -617,8 +651,8 @@ jobs:
         if: inputs.push-to-dockerhub
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
-          username: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
-          password: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_TOKEN || secrets.DOCKERHUB_TOKEN }}
+          username: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || (inputs.secrets-source != 'openbao' && secrets.DOCKERHUB_USERNAME || '') }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_TOKEN || (inputs.secrets-source != 'openbao' && secrets.DOCKERHUB_TOKEN || '') }}
 
       - name: Compose image list
         id: images
@@ -635,7 +669,7 @@ jobs:
                 echo "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}"
               fi
               if [ "${{ inputs.push-to-dockerhub }}" = "true" ]; then
-                echo "${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}/${{ inputs.image-name }}"
+                echo "${{ inputs.secrets-source == 'openbao' && env.DOCKERHUB_USERNAME || (inputs.secrets-source != 'openbao' && secrets.DOCKERHUB_USERNAME || '') }}/${{ inputs.image-name }}"
               fi
             } | tr '[:upper:]' '[:lower:]'
             echo "EOF"
@@ -675,10 +709,10 @@ jobs:
       - name: Compose pip index secrets
         if: inputs.mount-pip-index
         env:
-          NEXUS_HOST: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
-          NEXUS_PORT: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
-          NEXUS_USER: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          NEXUS_PASS: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          NEXUS_HOST: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_HOST || '') }}
+          NEXUS_PORT: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PORT || '') }}
+          NEXUS_USER: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          NEXUS_PASS: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
           CTX: ${{ inputs.environment }}
         run: |
           set -euo pipefail
@@ -737,10 +771,10 @@ jobs:
       - name: Compose npm registry secret
         if: inputs.mount-npm-registry
         env:
-          NEXUS_HOST: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || secrets.NEXUS_HOST }}
-          NEXUS_PORT: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || secrets.NEXUS_PORT }}
-          NEXUS_USER: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || secrets.NEXUS_USERNAME }}
-          NEXUS_PASS: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || secrets.NEXUS_PASSWORD }}
+          NEXUS_HOST: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_HOST || (inputs.secrets-source != 'openbao' && secrets.NEXUS_HOST || '') }}
+          NEXUS_PORT: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PORT || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PORT || '') }}
+          NEXUS_USER: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_USERNAME || (inputs.secrets-source != 'openbao' && secrets.NEXUS_USERNAME || '') }}
+          NEXUS_PASS: ${{ inputs.secrets-source == 'openbao' && env.NEXUS_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.NEXUS_PASSWORD || '') }}
           NPM_REPO: ${{ inputs.npm-registry-repo }}
         run: |
           set -euo pipefail
@@ -842,8 +876,8 @@ jobs:
           bom-file: ${{ steps.sbom.outputs.bom-file }}
           project-name: ${{ inputs.sbom-project-name != '' && inputs.sbom-project-name || format('{0}-image', inputs.image-name) }}
           project-version: ${{ inputs.sbom-project-version }}
-          server-url: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_URL || secrets.DEPENDENCYTRACK_URL }}
-          api-key: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_API_KEY || secrets.DEPENDENCYTRACK_API_KEY }}
+          server-url: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_URL || (inputs.secrets-source != 'openbao' && secrets.DEPENDENCYTRACK_URL || '') }}
+          api-key: ${{ inputs.secrets-source == 'openbao' && env.DEPENDENCYTRACK_API_KEY || (inputs.secrets-source != 'openbao' && secrets.DEPENDENCYTRACK_API_KEY || '') }}
 
       # -----------------------------------------------------------------------
       # Vulnerability scan — Grype scans the pushed image against its CVE DB and
@@ -913,8 +947,8 @@ jobs:
         with:
           images: ${{ steps.images.outputs.list }}
           digest: ${{ steps.build.outputs.digest }}
-          private-key: ${{ inputs.secrets-source == 'openbao' && env.COSIGN_PRIVATE_KEY || secrets.COSIGN_PRIVATE_KEY }}
-          password: ${{ inputs.secrets-source == 'openbao' && env.COSIGN_PASSWORD || secrets.COSIGN_PASSWORD }}
+          private-key: ${{ inputs.secrets-source == 'openbao' && env.COSIGN_PRIVATE_KEY || (inputs.secrets-source != 'openbao' && secrets.COSIGN_PRIVATE_KEY || '') }}
+          password: ${{ inputs.secrets-source == 'openbao' && env.COSIGN_PASSWORD || (inputs.secrets-source != 'openbao' && secrets.COSIGN_PASSWORD || '') }}
           # Same plain-HTTP connector BuildKit just pushed to. Named explicitly
           # so only the Nexus reference is signed over HTTP; the GHCR and Docker
           # Hub references in the same list keep TLS.
