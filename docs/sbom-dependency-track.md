@@ -100,7 +100,10 @@ jobs:
   `openbao-tools` a `context` that disagrees stops the job at that read, before
   the login. The default, `prod`, would stop every branch build that lists a
   tool: pass the expression above. For a tool not listed, the `ocs/ci/shared`
-  names serve both contexts and nothing checks it.
+  names serve both contexts and nothing checks it. The default stays `prod`
+  all the same: callers in GitHub-secrets mode that pass no `context` (such as
+  `python-demo.yml`, which runs `sbom.yml` on tag builds only) rely on it for
+  their release SBOMs, and `tests/openbao_secrets_test.sh` pins it.
 - **The caller job grants `id-token: write`.** `sbom.yml` has no
   `permissions:` block of its own: it takes what the calling job grants.
 - **Where each job reaches OpenBao.** The `sbom` job's container joins the

@@ -605,6 +605,20 @@ check "node-workflow.yml: container job joins the openbao network only in openba
 check "sbom.yml: every read passes context as environment for the build-kind check" \
   "[ \"\$(grep -c '^          tools: ' '$SBOM')\" -gt 0 ] && [ \"\$(grep -c '^          tools: ' '$SBOM')\" = \"\$(grep -c '^          environment: \${{ inputs.context }}\$' '$SBOM')\" ]"
 check "sbom.yml: runs-on is an input, default self-hosted" "grep -A4 '^      runs-on:' '$SBOM' | grep -q 'default: self-hosted' && ! grep -q '^    runs-on: self-hosted' '$SBOM'"
+# The context default stays prod, as before openbao mode. A caller in github
+# mode that passes none relies on it, e.g. python-demo.yml, which calls sbom.yml
+# on tag builds only: dev would quietly resolve its release SBOMs against the
+# dev Nexus. In openbao mode that default stops a branch build at the read (see
+# above), which is why callers pass context from the build kind, and why the
+# default must not be "fixed" to dev. Read in the input's own block, up to the
+# next input: one default:, prod plain or quoted.
+sbom_context_default() {
+  local block
+  block="$(awk '/^      context:$/ { f = 1; next } f && /^      [a-z-]+:/ { exit } f' "$SBOM")"
+  [ "$(printf '%s\n' "$block" | grep -c '^        default:')" = 1 ] \
+    && printf '%s\n' "$block" | grep -Eqx "        default: (prod|\"prod\"|'prod')"
+}
+check "sbom.yml: context defaults to prod, which github-mode callers that pass none rely on (python-demo.yml)" sbom_context_default
 check "sbom.yml: its container job joins the openbao network only in openbao mode" "[ \"\$(grep -c -- \"secrets-source == 'openbao' && '--network ocs_openbao' || ''\" '$SBOM')\" = 1 ]"
 check "sbom.yml reads no Cosign value from OpenBao" "! grep -q \"' cosign '\" '$SBOM' && ! grep -q 'COSIGN_' '$SBOM'"
 if python3 -c 'import yaml' 2>/dev/null; then
