@@ -51,7 +51,11 @@ run_step nexus.example.internal:5000 auto
 check "auto + any other registry: default bridge (no network opt)" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
 
 run_step 127.0.0.1:5001 auto
-check "auto + a loopback registry (127.0.0.1:5001): default bridge (unchanged behaviour)" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
+check "auto + a loopback registry (127.0.0.1:5001): builder on the host network" "[ $RC -eq 0 ] && grep -qx 'network=host' '$WORK/opts'"
+run_step localhost:5001 auto
+check "auto + localhost: builder on the host network" "[ $RC -eq 0 ] && grep -qx 'network=host' '$WORK/opts'"
+run_step 127.0.0.1:5001 bridge
+check "builder-network bridge keeps the default bridge even for a loopback registry" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"
 
 run_step evilocs-registry.local auto
 check "auto + a look-alike host (no dot before ocs-registry.local): default bridge" "[ $RC -eq 0 ] && ! grep -q '^network=' '$WORK/opts'"

@@ -42,8 +42,12 @@ fails with `dial tcp: lookup <registry name> on <dns>:53: no such host`.
 
 `builder-network: auto` (the default) gives the builder `network=host` whenever
 the resolved registry host is one of the internal registry names (the step
-matches them by their suffix), so it shares the node's `/etc/hosts` and
-loopback; any other registry keeps the default bridge.
+matches them by their suffix) or a loopback address (`127.*`, `localhost`: the
+node's own published connector), so it shares the node's `/etc/hosts` and
+loopback; any other registry keeps the default bridge. Syft, Grype, Dockle and
+Cosign run in the runner's container, not in the builder: a loopback registry
+is not the node there, so a build that scans or signs needs a registry name the
+runner's container reaches.
 `host` / `bridge` force one or the other. The `buildkitd.toml` entry
 `[registry."<registry name>"] http = true` (from `insecure-registry`) is
 unchanged: the name has no port. On the default bridge the push fails with the

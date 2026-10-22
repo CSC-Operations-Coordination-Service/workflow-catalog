@@ -543,8 +543,13 @@ jobs:
           reg_host="${NEXUS_DOCKER_REGISTRY%%:*}"
           case "$BUILDER_NETWORK" in
             auto)
+              # The internal registry names resolve only through the node's
+              # /etc/hosts; a loopback registry (127.0.0.1, localhost) is the
+              # node's own published connector, which a builder on the default
+              # bridge cannot reach (there 127.0.0.1 is the builder itself:
+              # "connection refused", 2026-10-22). Both need the node's network.
               case "$reg_host" in
-                *.ocs-registry.local) net=host ;;
+                *.ocs-registry.local | 127.* | localhost) net=host ;;
                 *) net="" ;;
               esac ;;
             host) net=host ;;
@@ -554,7 +559,7 @@ jobs:
               exit 1 ;;
           esac
           if [ "$net" = host ]; then
-            echo "BuildKit builder joins the runner node's host network (builder-network: $BUILDER_NETWORK, registry host $reg_host): the registry name resolves only through the node's /etc/hosts"
+            echo "BuildKit builder joins the runner node's host network (builder-network: $BUILDER_NETWORK, registry host $reg_host): the registry is reachable only from the node's own network"
           fi
 
           # An explicit host:port wins; otherwise pair the given connector port
