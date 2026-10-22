@@ -275,8 +275,8 @@ directly can. `@*` accepts any catalog ref, for two reasons:
 
 - pilot repositories call the catalog at a branch while it is tested;
 - through `node-workflow.yml`, the `uses:` line that calls `docker-build.yml`
-  is the catalog's own nested call, not the pilot's. It names
-  `@ci/openbao-secrets` on this branch and `@develop` after the merge (below).
+  is the catalog's own nested call, not the pilot's. It names `@develop` on
+  `develop`.
   A release made as [releasing.md](releasing.md) says pins it to the release
   tag, so a pilot that calls such a release through `node-workflow.yml`
   presents `docker-build.yml@refs/tags/<tag>` (with the nested-call assumption
@@ -315,10 +315,11 @@ can still request the job's token and log in as `-sign`. Those steps run only
 actions the catalog pins, never a project's dependencies: the image's `RUN`
 steps run inside BuildKit, without the job's token.
 
-### Test it from a pilot repository
+### Use it from a repository
 
-While the branch `ci/openbao-secrets` is under test, call the catalog at that
-ref. Its own workflows call the action and `docker-build.yml` at the same ref.
+Call the catalog at `@develop` (merged on 2026-10-22), or at a release once one
+is cut ([releasing.md](releasing.md)). Its own workflows call the action and
+`docker-build.yml` at the same ref.
 
 ```yaml
 jobs:
@@ -327,7 +328,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@ci/openbao-secrets
+    uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/workflows/node-workflow.yml@develop
     with:
       runs-on: containerized
       secrets-source: openbao
@@ -352,10 +353,6 @@ jobs:
    "Check secrets-source and openbao-tools", and so does `sign-image` on a
    `docker-release` build without `cosign` in `openbao-tools`, or with
    `docker-environment` other than `prod`.
-
-Before the branch is merged, every `@ci/openbao-secrets` ref inside the
-catalog goes back to `@develop` (`scripts/pin-catalog-refs.sh develop`, see
-[releasing.md](releasing.md)), and the pilots move to `@develop` with it.
 
 The action's devsecops read can be tested locally against a mock OpenBao:
 `bash tests/openbao_secrets_tools_test.sh` (node, openssl and PyYAML; no

@@ -120,9 +120,8 @@ jobs:
   mode the value comes from OpenBao. With `dependency-track` in
   `openbao-tools`, the read itself stops on an empty field.
 
-While the openbao mode is tested on the catalog branch `ci/openbao-secrets`,
-call `sbom.yml` at that ref, as
-[openbao-secrets.md](openbao-secrets.md#test-it-from-a-pilot-repository) says.
+Call `sbom.yml` at `@develop` or a release, as
+[openbao-secrets.md](openbao-secrets.md#use-it-from-a-repository) says.
 
 ## The shared primitives
 

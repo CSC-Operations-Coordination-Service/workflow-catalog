@@ -416,7 +416,7 @@ jobs:
       # whose environment disagrees, before "Resolve Nexus registry" would.
       - name: Read secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@develop
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
@@ -426,7 +426,7 @@ jobs:
 
       - name: Read Docker Hub secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.push-to-dockerhub
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@develop
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
@@ -436,7 +436,7 @@ jobs:
 
       - name: Read Dependency-Track secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.generate-sbom
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@develop
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
@@ -1031,7 +1031,7 @@ jobs:
       # fallback: every build's role reads that layout.
       - name: Read Cosign secrets from OpenBao
         if: inputs.secrets-source == 'openbao' && inputs.sign-image && inputs.release
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@develop
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}

@@ -191,7 +191,7 @@ jobs:
       # stops the job here, before anything is installed.
       - name: Read Nexus secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@develop
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
@@ -287,7 +287,7 @@ jobs:
       # a tag build devsecops/ci/prod/dependency-track, never the other.
       - name: Read Dependency-Track secrets from OpenBao
         if: inputs.secrets-source == 'openbao'
-        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@ci/openbao-secrets
+        uses: CSC-Operations-Coordination-Service/workflow-catalog/.github/actions/openbao-secrets@develop
         with:
           openbao-url: ${{ inputs.openbao-url }}
           role: ${{ inputs.openbao-role }}
