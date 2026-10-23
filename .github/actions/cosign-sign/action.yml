@@ -31,6 +31,25 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # cosign-installer runs `envsubst` on its install-dir input and stops without it. The
+    # containerized runners' image does not ship it (no gettext-base, and its build installs
+    # nothing from apt), so a shim goes on PATH for the later steps when the tool is missing.
+    - name: Provide envsubst when the runner lacks it
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if command -v envsubst >/dev/null 2>&1; then
+          echo "envsubst is installed"
+        else
+          shim_dir="$RUNNER_TEMP/envsubst-shim"
+          mkdir -p "$shim_dir"
+          install -m 0755 "$ACTION_PATH/envsubst-shim.sh" "$shim_dir/envsubst"
+          echo "$shim_dir" >> "$GITHUB_PATH"
+          echo "envsubst not found on this runner: using the bundled shim"
+        fi
+
     - name: Install Cosign
       uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
