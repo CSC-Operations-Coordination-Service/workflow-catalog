@@ -14,6 +14,7 @@ the same building blocks — see the [catalog overview](README.md).
 
 ```
 (optional Nexus registry) → install → lint → build → test
+                          → (optional SonarQube scan, its own job)
                           → (optional npm SBOM → Dependency-Track)
                           → (optional Docker image via docker-build.yml)
 ```
@@ -69,6 +70,9 @@ jobs:
 | `run-build` / `build-command` | `true` / `npm run build` | Build step |
 | `run-tests` / `test-command` | `false` / `npm test` | Test step (off by default) |
 | `build-env` | `""` | Newline-separated `KEY=VALUE` exported before build/test (CI build defaults) |
+| `run-sonarqube` | `false` | SonarQube scan after the tests, in its own job (`sonarqube`). See [SonarQube](#sonarqube) |
+| `sonar-project-dir` | `""` (= `working-directory`) | Directory with `sonar-project.properties`, also the scan's base directory |
+| `sonar-reports-dir` | `coverage` | Directory under `working-directory` that the test command writes its reports to; kept as an artifact and restored in the scan job |
 | `generate-sbom` | `false` | CycloneDX npm SBOM → Dependency-Track |
 | `sbom-project-name` / `sbom-project-version` | package name / — | DT project identity |
 | `build-image` | `false` | Build + push an image via `docker-build.yml` |
@@ -101,9 +105,41 @@ Credentials are optional: a Nexus npm proxy is commonly readable anonymously, an
 the auth line is written only when `NEXUS_USERNAME` and `NEXUS_PASSWORD` are both
 set. The step logs which mode it used.
 
+## SonarQube
+
+`run-sonarqube: true` adds a `sonarqube` job that runs after `node-ci`, as
+[`python-ci.yml`](../.github/workflows/python-ci.yml) does for Python, so a scanner or
+server problem reads differently from a failing test. It reads `SONAR_TOKEN` and
+`SONAR_HOST_URL`, checks them against the server before scanning, and runs the
+`sonarqube-scan-action` with `projectBaseDir` set to `sonar-project-dir`.
+
+The scan is only as good as the reports it gets. The project's `test-command` writes
+them under `sonar-reports-dir`; the `node-ci` job uploads that directory as the
+artifact `node-test-reports` and the scan job restores it at the same path, so the
+`sonar-project.properties` paths resolve as they do locally. Without the directory the
+scan still runs, with no coverage. For vitest:
+
+```yaml
+    with:
+      run-tests: true
+      test-command: pnpm test:coverage          # vitest run --coverage, lcov reporter
+      run-sonarqube: true
+      openbao-tools: nexus sonarqube            # with secrets-source: openbao
+```
+
+```properties
+# sentiboard-frontend/sonar-project.properties
+sonar.javascript.lcov.reportPaths=coverage/lcov.info
+```
+
+With `secrets-source: openbao`, list `sonarqube` in `openbao-tools`: a tool left out is
+read from `ocs/ci/shared/SONAR_*`, which a role without `ci-shared` cannot read
+([openbao-secrets.md](openbao-secrets.md)).
+
 ## Secrets
 
 Provide with `secrets: inherit` (or read them from OpenBao instead, with `secrets-source: openbao`: [openbao-secrets.md](openbao-secrets.md)). Consumed only when the matching feature is enabled:
 `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` (`use-nexus-registry`);
+`SONAR_TOKEN`, `SONAR_HOST_URL` (`run-sonarqube`);
 `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` (SBOM); `NEXUS_DOCKER_REGISTRY_DEV/_PROD`,
 `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (image).

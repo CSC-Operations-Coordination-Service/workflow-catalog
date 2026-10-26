@@ -101,6 +101,7 @@ without its value.
 | Workflow | When | Names under `ocs/ci/shared` |
 | --- | --- | --- |
 | `node-workflow.yml` | `use-nexus-registry` | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD` |
+| `node-workflow.yml` | `run-sonarqube` (job `sonarqube`) | `SONAR_TOKEN`, `SONAR_HOST_URL` |
 | `node-workflow.yml` | `generate-sbom` | `DEPENDENCYTRACK_URL`, `DEPENDENCYTRACK_API_KEY` |
 | `docker-build.yml` | always | `NEXUS_HOST`, `NEXUS_PORT`, `NEXUS_USERNAME`, `NEXUS_PASSWORD`, `NEXUS_DOCKER_REGISTRY_DEV`, `NEXUS_DOCKER_REGISTRY_PROD` |
 | `docker-build.yml` | `push-to-dockerhub` | `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` |
